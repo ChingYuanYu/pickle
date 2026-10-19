@@ -96,7 +96,7 @@ The environment is managed with [uv](https://docs.astral.sh/uv/). `uv sync` crea
 uv sync --extra yolo                                              # add the YOLO people detector (recommended for real footage)
 uv run pbcoach match.mp4 --out runs/match1                        # YOLO people detector if installed
 uv run pbcoach match.mp4 --out runs/match1 --detector foreground --empty-court empty.jpg
-uv run pytest -q tests/test_core.py                               # 11 tests, about 30 s
+uv run pytest -q tests/test_core.py                               # 14 tests
 uv run python -m tests.eval_calibration --seeds 4 --players       # angle-robustness benchmarks
 uv run python -m tests.eval_tracking
 ```
@@ -133,6 +133,6 @@ Keypoint names are listed in `pbcoach/court.py` (`KEYPOINTS`).
 
 - **Real footage.** The numbers above come from synthetic renders. One real indoor clip (camera about 1.7 m high behind a corner, low resolution) now tracks all four players with steady identities, but far-side positions there are still only good to about a meter, and automatic court finding needed hand-placed points. Hand-labelled real clips from several angles are the next step.
 - **Lens distortion.** GoPro and phone ultra-wide lenses bend court lines. A distortion parameter is needed in the line fit.
-- **Moving cameras.** The prototype assumes a fixed tripod. A handheld phone needs re-calibration per segment.
+- **Moving cameras.** The prototype assumes a fixed camera. Broadcast clips with camera cuts are split at each cut and the longest shot is analyzed; a handheld or panning camera still needs re-calibration per segment.
 - **3D poses** are a single-camera approximation: each 2D skeleton is stood upright in a plane facing the camera, so limbs pointing at the camera come out flattened.
 - **Ball tracking and shots.** These are stage 3 of the design and not started.

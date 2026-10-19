@@ -19,15 +19,23 @@ from .players import CourtTracker, OccupancyDetector, YoloDetector, lift_keypoin
 from .viz import draw_court, draw_ring, draw_skeleton, minimap, player_color
 
 
-def read_frames(path: str, max_frames: int | None = None, stride: int = 1):
+def read_frames(path: str, stride: int = 1, start: int = 0, end: int | None = None):
+    """Yield (frame index, frame, effective fps) for frames start <= i < end, every stride-th."""
     cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     i = 0
     while True:
-        ok, frame = cap.read()
-        if not ok or (max_frames and i >= max_frames * stride):
+        if end is not None and i >= end:
             break
-        if i % stride == 0:
+        if i < start:   # sequential reads: seeking is unreliable across codecs
+            if not cap.grab():
+                break
+            i += 1
+            continue
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if (i - start) % stride == 0:
             yield i, frame, fps / stride
         i += 1
     cap.release()
@@ -44,20 +52,31 @@ def video_frame_count(path: str) -> int:
     return total
 
 
-def sample_frames(path: str, n: int = 40) -> list[np.ndarray]:
-    total = video_frame_count(path)
-    wanted = set(np.linspace(0, max(0, total - 1), max(1, min(n, total))).astype(int).tolist())
-    out = []
+def find_shots(path: str, end: int | None = None, cut_threshold: float = 30.0) -> list[tuple[int, int]]:
+    """Split a video into camera shots at hard cuts, as (start, end) frame ranges.
+
+    Broadcast highlights and edited clips cut between cameras; the court calibration only holds
+    within one shot.
+    """
     cap = cv2.VideoCapture(path)
-    for i in range(total):  # sequential reads: seeking is unreliable across codecs
-        if not cap.grab():
+    prev, cuts, i = None, [0], 0
+    while end is None or i < end:
+        ok, f = cap.read()
+        if not ok:
             break
-        if i in wanted:
-            ok, f = cap.retrieve()
-            if ok:
-                out.append(f)
+        g = cv2.resize(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY), (160, 90), interpolation=cv2.INTER_AREA).astype(np.int16)
+        if prev is not None and float(np.abs(g - prev).mean()) > cut_threshold:
+            cuts.append(i)
+        prev, i = g, i + 1
     cap.release()
-    return out
+    bounds = cuts + [i]
+    return [(a, b) for a, b in zip(bounds, bounds[1:]) if b > a]
+
+
+def sample_frames(path: str, n: int = 40, start: int = 0, end: int | None = None) -> list[np.ndarray]:
+    end = video_frame_count(path) if end is None else end
+    wanted = set(np.linspace(start, max(start, end - 1), max(1, min(n, end - start))).astype(int).tolist())
+    return [f for i, f, _ in read_frames(path, 1, start, end) if i in wanted]
 
 
 def smooth_rows(rows: list[dict], fps: float) -> list[dict]:
@@ -134,14 +153,14 @@ def build_replay(cal: Calibration, rows: list[dict], seen: dict, fps: float) -> 
             "frames": frames}
 
 
-def render_overlay(video, path: Path, cal: Calibration, rows, seen, max_frames, stride):
+def render_overlay(video, path: Path, cal: Calibration, rows, seen, stride, start, end):
     """Video with each player's ground ring and skeleton in their color, plus a top-down map."""
     by_frame = {}
     for r in rows:
         by_frame.setdefault(r["frame"], []).append(r)
     trails = {}
     writer = None
-    for idx, frame, fps in read_frames(video, max_frames, stride):
+    for idx, frame, fps in read_frames(video, stride, start, end):
         vis = draw_court(frame.copy(), cal.H, (0, 220, 255), 1)
         positions = {}
         for r in by_frame.get(idx, []):
@@ -185,11 +204,19 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
     report = progress or (lambda frac, msg: None)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    report(0.0, "Building the empty-court background")
+    report(0.0, "Finding camera cuts")
+    end = max_frames * stride if max_frames else None
+    shots = find_shots(video, end)
+    if not shots:
+        raise SystemExit(f"could not read {video}")
+    start, end = max(shots, key=lambda s: s[1] - s[0])   # analyze the longest continuous shot
+    if len(shots) > 1:
+        print(f"{len(shots)} camera shots found; analyzing the longest, frames {start}-{end - 1}")
+    report(0.03, "Building the empty-court background")
     if empty_court:  # a photo of the empty court from the same camera beats a median of frames
         bg = cv2.imread(empty_court)
     else:
-        frames = sample_frames(video)
+        frames = sample_frames(video, 40, start, end)
         if not frames:
             raise SystemExit(f"could not read {video}")
         bg = median_background(frames)
@@ -211,17 +238,15 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
         print("  note:", n)
 
     det = make_detector(detector, bg, cal)
-    total = video_frame_count(video)
-    if max_frames:
-        total = min(total, max_frames * stride) if total else max_frames * stride
+    total = end - start
     tracker = None
     rows = []
     seen = {}   # frame -> {player_id: (raw ground xy, keypoints or None)} for rendering and 3D replay
-    for idx, frame, fps in read_frames(video, max_frames, stride):
+    for idx, frame, fps in read_frames(video, stride, start, end):
         if tracker is None:
             tracker = CourtTracker(fps)
         if total and idx % (5 * stride) == 0:
-            report(0.1 + 0.75 * idx / total, f"Tracking players: frame {idx} of {total}")
+            report(0.1 + 0.75 * (idx - start) / total, f"Tracking players: frame {idx - start} of {total}")
         tracks = tracker.update(locate(cal, det(frame)), idx)
         for t in tracks:
             rows.append({"frame": idx, "t": round(idx / (fps * stride), 3), "player_id": t.id, "team": t.team,
@@ -240,7 +265,7 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
     (out / "replay.json").write_text(json.dumps(replay, separators=(",", ":")))
     if write_video:
         report(0.88, "Drawing the overlay video")
-        render_overlay(video, out / "overlay.mp4", cal, rows, seen, max_frames, stride)
+        render_overlay(video, out / "overlay.mp4", cal, rows, seen, stride, start, end)
     fps_eff = tracker.dt ** -1 if tracker else 30.0
     summary = {"calibration": cal.summary(), "players": player_metrics(rows, fps_eff), "teams": team_metrics(rows)}
     (out / "metrics.json").write_text(json.dumps(summary, indent=2))
