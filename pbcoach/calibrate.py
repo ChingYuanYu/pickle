@@ -254,7 +254,10 @@ def _evaluate(H: np.ndarray, mask: np.ndarray) -> float:
     if not np.isfinite(H).all():
         return -np.inf
     scorer = _Scorer(mask, step=0.05)
-    pose = pose_from_homography(H, (w, h))
+    try:
+        pose = pose_from_homography(H, (w, h))
+    except (ValueError, np.linalg.LinAlgError):
+        return -np.inf
     if pose.position[2] <= 0.2:
         return -np.inf
     poly, tape = _net_geometry(pose)
@@ -321,7 +324,10 @@ def _refine(H: np.ndarray, mask: np.ndarray, iters: int = 4) -> np.ndarray:
     for it in range(iters):
         base_band = max(2.0, 0.012 * diag * (0.6 ** it))
         keep = np.ones(len(mpts), bool)
-        pose = pose_from_homography(H, (w, h))
+        try:
+            pose = pose_from_homography(H, (w, h))
+        except (ValueError, np.linalg.LinAlgError):
+            break
         _, tape = _net_geometry(pose)
         if tape is not None and np.isfinite(tape).all() and np.abs(tape).max() < 1e6:
             tape_mask = np.zeros((h, w), np.uint8)
@@ -483,7 +489,10 @@ def calibrate_image(img: np.ndarray, focal_px: float | None = None) -> Calibrati
     options = []
     for Hc in shortlist:  # keep the refined fit only where it actually explains the image better
         options += [Hc, _refine(Hc, mask)]
+    options = [Hc for Hc in options if np.isfinite(Hc).all()]
     scores = [_evaluate(Hc, mask) for Hc in options]
+    if not options or max(scores) == -np.inf:
+        return None
     H = options[int(np.argmax(scores))]
     H = _canonical(H, (w, h))
     if focal_px is None:

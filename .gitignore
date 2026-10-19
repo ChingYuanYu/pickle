@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+runs/
+*.pt
+*.mp4
+.pytest_cache/

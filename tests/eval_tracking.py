@@ -29,6 +29,7 @@ def make_video(view, path: Path, n_frames: int, seed: int = 0, fps: int = 15):
         img, *_ = synth.render(view, scene, seed=seed, background=bg)
         vw.write(img)
     vw.release()
+    cv2.imwrite(str(path.with_suffix(".bg.png")), bg)
     return pos
 
 
@@ -65,11 +66,15 @@ def main():
     a = ap.parse_args()
     views = [v for v in synth.VIEWS if not a.views or v.name in a.views.split(",")]
     tmp = Path(a.keep) if a.keep else Path(tempfile.mkdtemp())
+    tmp.mkdir(parents=True, exist_ok=True)
     print(f"{'view':22s} mean_pos_err_m  players_found_within_50cm")
     for v in views:
         vid = tmp / f"{v.name}.mp4"
         gt = make_video(v, vid, a.frames)
-        run(str(vid), str(tmp / v.name), detector="foreground", write_video=bool(a.keep))
+        # Short clips: players barely move, so a median of frames would keep them in the
+        # background. Use the empty-court frame, as a user would with --empty-court.
+        run(str(vid), str(tmp / v.name), detector="foreground", write_video=bool(a.keep),
+            empty_court=str(vid.with_suffix(".bg.png")))
         err, found = score(tmp / v.name / "tracks.csv", gt)
         print(f"{v.name:22s} {err:14.3f}  {found:8.1%}")
 

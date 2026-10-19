@@ -66,13 +66,16 @@ def make_detector(kind: str, background: np.ndarray, cal: Calibration):
 
 
 def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None = None, stride: int = 1,
-        points_json: str | None = None, write_video: bool = True) -> dict:
+        points_json: str | None = None, write_video: bool = True, empty_court: str | None = None) -> dict:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    frames = sample_frames(video)
-    if not frames:
-        raise SystemExit(f"could not read {video}")
-    bg = median_background(frames)
+    if empty_court:  # a photo of the empty court from the same camera beats a median of frames
+        bg = cv2.imread(empty_court)
+    else:
+        frames = sample_frames(video)
+        if not frames:
+            raise SystemExit(f"could not read {video}")
+        bg = median_background(frames)
     h, w = bg.shape[:2]
 
     if points_json:
@@ -136,9 +139,10 @@ def main():
     ap.add_argument("--max-frames", type=int)
     ap.add_argument("--stride", type=int, default=1)
     ap.add_argument("--points", help="JSON with image_points and keypoints for manual calibration")
+    ap.add_argument("--empty-court", help="image of the empty court from the same camera position")
     ap.add_argument("--no-video", action="store_true")
     a = ap.parse_args()
-    s = run(a.video, a.out, a.detector, a.max_frames, a.stride, a.points, not a.no_video)
+    s = run(a.video, a.out, a.detector, a.max_frames, a.stride, a.points, not a.no_video, a.empty_court)
     print(json.dumps({"players": s["players"], "teams": s["teams"]}, indent=2))
 
 
