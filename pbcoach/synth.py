@@ -6,6 +6,7 @@ camera placed anywhere, and returns the exact ground-truth homography and foot p
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -219,3 +220,22 @@ def rally_positions(n_frames: int, seed: int = 0):
 
 
 SHIRTS = [(40, 40, 200), (40, 160, 230), (200, 80, 40), (160, 60, 160)]
+
+
+def make_rally_video(view: View, path, n_frames: int, seed: int = 0, fps: int = 15):
+    """Write a doubles rally clip to `path` and the empty court to `path` with suffix .bg.png.
+
+    Returns the true player positions, shape (frames, 4, 2), in court meters.
+    """
+    path = Path(path)
+    pos = rally_positions(n_frames, seed)
+    bg, *_ = render(view, Scene(), seed=seed)
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (bg.shape[1], bg.shape[0]))
+    for f in range(n_frames):
+        scene = Scene(players=[Player(x, y, SHIRTS[i]) for i, (x, y) in enumerate(pos[f])],
+                      noise=2.0, blur=0, jpeg=0)
+        img, *_ = render(view, scene, seed=seed, background=bg)
+        vw.write(img)
+    vw.release()
+    cv2.imwrite(str(path.with_suffix(".bg.png")), bg)
+    return pos

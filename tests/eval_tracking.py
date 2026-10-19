@@ -9,7 +9,6 @@ import csv
 import tempfile
 from pathlib import Path
 
-import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -17,20 +16,6 @@ from pbcoach import court, synth
 from pbcoach.pipeline import run
 
 R180 = np.array([[-1, 0, court.WIDTH], [0, -1, court.LENGTH], [0, 0, 1.0]])
-
-
-def make_video(view, path: Path, n_frames: int, seed: int = 0, fps: int = 15):
-    pos = synth.rally_positions(n_frames, seed)
-    bg, *_ = synth.render(view, synth.Scene(), seed=seed)
-    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (bg.shape[1], bg.shape[0]))
-    for f in range(n_frames):
-        scene = synth.Scene(players=[synth.Player(x, y, synth.SHIRTS[i]) for i, (x, y) in enumerate(pos[f])],
-                            noise=2.0, blur=0, jpeg=0)
-        img, *_ = synth.render(view, scene, seed=seed, background=bg)
-        vw.write(img)
-    vw.release()
-    cv2.imwrite(str(path.with_suffix(".bg.png")), bg)
-    return pos
 
 
 def score(tracks_csv: Path, gt: np.ndarray):
@@ -70,7 +55,7 @@ def main():
     print(f"{'view':22s} mean_pos_err_m  players_found_within_50cm")
     for v in views:
         vid = tmp / f"{v.name}.mp4"
-        gt = make_video(v, vid, a.frames)
+        gt = synth.make_rally_video(v, vid, a.frames)
         # Short clips: players barely move, so a median of frames would keep them in the
         # background. Use the empty-court frame, as a user would with --empty-court.
         run(str(vid), str(tmp / v.name), detector="foreground", write_video=bool(a.keep),

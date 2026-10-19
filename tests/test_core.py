@@ -74,3 +74,23 @@ def test_tracker_keeps_ids():
         tracks = tr.update(dets, f)
     assert sorted(t.id for t in tracks) == [1, 2]
     assert {t.team for t in tracks} == {"near", "far"}
+
+
+def _rows(positions, fps=10):
+    """Tracker-style rows from {player_id: (team, [(x, y), ...])}."""
+    return [{"frame": f, "t": f / fps, "player_id": pid, "team": team, "x": x, "y": y}
+            for pid, (team, path) in positions.items() for f, (x, y) in enumerate(path)]
+
+
+def test_coach_flags_split_partners_and_praises_spacing():
+    from pbcoach import coach
+    n = 60
+    up = [(1.5, court.NVZ_NEAR_Y - 0.3)] * n          # at the kitchen line
+    back = [(4.5, 0.5)] * n                            # stays on the baseline
+    ghost = [(3.0, 3.0)] * 3                           # too short to be a player
+    rows = _rows({1: ("near", up), 2: ("near", back), 9: ("near", ghost)})
+    assert coach.player_ids(rows) == {1, 2}
+    titles = {(i.who.split(" (")[0], i.title) for i in coach.analyze(rows, {"calibration": {"score": 1.0}}, 10)}
+    assert ("Near team", "Partners split up and back") in titles
+    assert ("Player 2", "Never reached the kitchen line") in titles
+    assert ("Player 1", "Gets to the kitchen line") in titles

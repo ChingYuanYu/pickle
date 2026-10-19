@@ -32,7 +32,7 @@ def read_frames(path: str, max_frames: int | None = None, stride: int = 1):
     cap.release()
 
 
-def sample_frames(path: str, n: int = 40) -> list[np.ndarray]:
+def video_frame_count(path: str) -> int:
     cap = cv2.VideoCapture(path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total <= 0:  # some containers do not report a frame count: count by reading
@@ -40,6 +40,11 @@ def sample_frames(path: str, n: int = 40) -> list[np.ndarray]:
         while cap.grab():
             total += 1
     cap.release()
+    return total
+
+
+def sample_frames(path: str, n: int = 40) -> list[np.ndarray]:
+    total = video_frame_count(path)
     wanted = set(np.linspace(0, max(0, total - 1), max(1, min(n, total))).astype(int).tolist())
     out = []
     cap = cv2.VideoCapture(path)
@@ -66,9 +71,13 @@ def make_detector(kind: str, background: np.ndarray, cal: Calibration):
 
 
 def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None = None, stride: int = 1,
-        points_json: str | None = None, write_video: bool = True, empty_court: str | None = None) -> dict:
+        points_json: str | None = None, write_video: bool = True, empty_court: str | None = None,
+        progress=None) -> dict:
+    """progress: optional callback(fraction, message) for front ends."""
+    report = progress or (lambda frac, msg: None)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    report(0.0, "Building the empty-court background")
     if empty_court:  # a photo of the empty court from the same camera beats a median of frames
         bg = cv2.imread(empty_court)
     else:
@@ -78,6 +87,7 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
         bg = median_background(frames)
     h, w = bg.shape[:2]
 
+    report(0.1, "Finding the court and the camera")
     if points_json:
         spec = json.loads(Path(points_json).read_text())
         cal = calibrate_from_points(spec["image_points"], spec["keypoints"], (w, h))
@@ -93,12 +103,17 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
         print("  note:", n)
 
     det = make_detector(detector, bg, cal)
+    total = video_frame_count(video)
+    if max_frames:
+        total = min(total, max_frames * stride) if total else max_frames * stride
     tracker = None
     rows = []
     writer = None
     for idx, frame, fps in read_frames(video, max_frames, stride):
         if tracker is None:
             tracker = CourtTracker(fps)
+        if total and idx % (5 * stride) == 0:
+            report(0.15 + 0.8 * idx / total, f"Tracking players: frame {idx} of {total}")
         dets = locate(cal, det(frame))
         tracks = tracker.update(dets, idx)
         for t in tracks:
@@ -128,6 +143,7 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
     fps_eff = tracker.dt ** -1 if tracker else 30.0
     summary = {"calibration": cal.summary(), "players": player_metrics(rows, fps_eff), "teams": team_metrics(rows)}
     (out / "metrics.json").write_text(json.dumps(summary, indent=2))
+    report(1.0, "Done")
     return summary
 
 

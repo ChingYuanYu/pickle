@@ -55,6 +55,22 @@ The renderer (`pbcoach/synth.py`) adds a neighbouring court, yellow tennis lines
 
 Low cameras (under about 2 m) lose the far players behind the net. That limit comes from geometry, not tuning: the image only says the player is somewhere along a line of sight. **Mount the camera at least 3 m high** if you can.
 
+## Demo app
+
+Upload a clip and see everything in the browser: the detected court and camera, the tracked video with a top-down minimap, heatmaps and paths per player, time behind the kitchen line, and coaching feedback you can ask follow-up questions about.
+
+```bash
+uv sync --extra demo --extra yolo     # yolo is recommended for real footage
+uv run pbcoach-demo                   # open http://localhost:7860 (add --share for a temporary public link)
+```
+
+No footage at hand? Pick a camera angle and click **Load a synthetic sample rally**.
+
+Coaching feedback comes from rules over the tracks (`pbcoach/coach.py`): time to reach the kitchen line, standing in the transition zone, partners split up and back, and partner spacing. With `ANTHROPIC_API_KEY` set, Claude also writes a short debrief and answers free-form questions. It sees only the computed numbers and findings, not the video. Set `PBCOACH_MODEL` to change the model.
+
+![Demo: coaching tab](docs/demo_coaching.png)
+![Demo: movement tab](docs/demo_movement.png)
+
 ## Run it
 
 The environment is managed with [uv](https://docs.astral.sh/uv/). `uv sync` creates `.venv` from `uv.lock`.
@@ -63,7 +79,7 @@ The environment is managed with [uv](https://docs.astral.sh/uv/). `uv sync` crea
 uv sync --extra yolo                                              # add the YOLO people detector (recommended for real footage)
 uv run pbcoach match.mp4 --out runs/match1                        # YOLO people detector if installed
 uv run pbcoach match.mp4 --out runs/match1 --detector foreground --empty-court empty.jpg
-uv run pytest -q tests/test_core.py                               # 10 tests, about 30 s
+uv run pytest -q tests/test_core.py                               # 11 tests, about 30 s
 uv run python -m tests.eval_calibration --seeds 4 --players       # angle-robustness benchmarks
 uv run python -m tests.eval_tracking
 ```
@@ -90,6 +106,9 @@ Keypoint names are listed in `pbcoach/court.py` (`KEYPOINTS`).
 | `pbcoach/players.py` | YOLO and occupancy detectors, angle-aware foot points, court-plane tracker |
 | `pbcoach/metrics.py` | Distance, zone share, kitchen-line time, partner spacing |
 | `pbcoach/pipeline.py` | Command-line entry point |
+| `pbcoach/coach.py` | Rule-based coaching findings, optional Claude debrief and Q&A |
+| `pbcoach/report.py` | Heatmaps, paths and kitchen-line distance series |
+| `pbcoach/demo.py` | Gradio web demo (`pbcoach-demo`) |
 | `pbcoach/synth.py` | Synthetic multi-angle renderer used by the tests |
 
 ## Not yet validated
