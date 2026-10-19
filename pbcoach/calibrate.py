@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 from . import court
-from .camera import CameraPose, consistency_weight, pose_from_homography, project, project_w
+from .camera import CameraPose, best_focal, consistency_weight, focal_residual_curve, pose_from_homography, project, project_w
 from .lines import Line, detect_lines, group_by_vanishing_point, line_mask
 
 
@@ -251,6 +251,8 @@ def _evaluate(H: np.ndarray, mask: np.ndarray) -> float:
     """Full score of one hypothesis: explained line length, minus painted lines that should be
     visible but are not (ignoring what the net hides), minus unexplained line pixels inside the court."""
     h, w = mask.shape[:2]
+    if not np.isfinite(H).all():
+        return -np.inf
     scorer = _Scorer(mask, step=0.05)
     pose = pose_from_homography(H, (w, h))
     if pose.position[2] <= 0.2:
@@ -287,7 +289,8 @@ def _evaluate(H: np.ndarray, mask: np.ndarray) -> float:
     stray = (mask > 0) & (inside > 0) & (model == 0) & (occluded == 0)
     line_px = max(1.0, float(np.median(2 * cv2.distanceTransform(mask, cv2.DIST_L2, 3)[mask > 0])))
     unexplained = stray.sum() / line_px
-    raw = float(explained[0]) - 0.5 * missing - 1.0 * unexplained
+    tape_hit, tape_miss = _net_tape_evidence(H, scorer.dist, scorer.tol)
+    raw = float(explained[0]) + tape_hit - 0.5 * (missing + tape_miss) - 3.0 * unexplained
     # A real camera must explain the match: penalize hypotheses whose two focal estimates disagree.
     return raw * float(consistency_weight(H, (w, h))) if raw > 0 else raw
 
@@ -387,6 +390,77 @@ def _canonical(H: np.ndarray, size) -> np.ndarray:
     return H if pose_a.position[1] <= court.NET_Y else H @ R180
 
 
+def _net_tape_samples(H, size, f):
+    pose = pose_from_homography(H, size, f)
+    _, tape = _net_geometry(pose)
+    if tape is None or not np.isfinite(tape).all() or np.abs(tape).max() > 1e6:
+        return None
+    return np.concatenate([np.linspace(a, b, 8, endpoint=False) for a, b in zip(tape[:-1], tape[1:])])
+
+
+def _net_tape_evidence(H, dist, tol, n_focal: int = 40):
+    """Image length of the net's white tape that this court hypothesis explains (best over
+    focal lengths), and the length it predicts but is not there. The net stands on the
+    court's midline, so a hypothesis that gets the court's orientation wrong puts it
+    somewhere with no tape."""
+    h, w = dist.shape
+    best = (0.0, 0.0)
+    f0 = best_focal(H, (w, h))  # the tape may refine the focal length, not override the court's
+    for f in np.geomspace(0.75 * f0, 1.33 * f0, n_focal):
+        pts = _net_tape_samples(H, (w, h), f)
+        if pts is None:
+            continue
+        vis = (pts[:, 0] >= 0) & (pts[:, 0] < w - 1) & (pts[:, 1] >= 0) & (pts[:, 1] < h - 1)
+        if vis.sum() < 2:
+            continue
+        p = pts[vis]
+        seg = np.linalg.norm(np.diff(p, axis=0), axis=1)
+        seg = np.append(seg, seg[-1] if len(seg) else 0.0)
+        on = dist[p[:, 1].astype(int), p[:, 0].astype(int)] < tol
+        hit, miss = float((seg * on).sum()), float((seg * ~on).sum())
+        if hit - 0.5 * miss > best[0] - 0.5 * best[1]:
+            best = (hit, miss)
+    return best
+
+
+def _focal_from_net(H: np.ndarray, mask: np.ndarray) -> float | None:
+    """The court plane alone pins down the focal length poorly when the camera looks straight
+    down the court. The net tape is a painted-white line at a known height (0.86 to 0.91 m),
+    so try focal lengths and keep the one whose predicted tape lands on line pixels."""
+    h, w = mask.shape[:2]
+    fs, e = focal_residual_curve(H, (w, h))
+    i0 = int(np.argmin(e))
+    f0 = float(fs[i0])
+    # If the court alone already pins the focal length (residual rises fast around its best
+    # value, as in side and corner views), the tape may only fine-tune it.
+    lo, hi = np.interp([0.75 * f0, 1.33 * f0], fs, e)
+    if min(lo, hi) > e[i0] + 0.05:
+        candidates = np.geomspace(0.85 * f0, 1.18 * f0, 40)
+    else:
+        candidates = np.geomspace(0.3 * w, 3.0 * w, 120)
+    dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3)
+    tol = max(2.5, 0.004 * np.hypot(h, w))
+    best, best_hits = None, -1.0
+    for f in candidates:
+        pose = pose_from_homography(H, (w, h), f)
+        _, tape = _net_geometry(pose)
+        if tape is None or not np.isfinite(tape).all():
+            continue
+        pts = np.concatenate([np.linspace(a, b, 8, endpoint=False) for a, b in zip(tape[:-1], tape[1:])])
+        vis = (pts[:, 0] >= 0) & (pts[:, 0] < w) & (pts[:, 1] >= 0) & (pts[:, 1] < h)
+        if vis.sum() < 20:
+            continue
+        p = pts[vis].astype(int)
+        hits = float((dist[p[:, 1], p[:, 0]] < tol).mean())
+        # Ground-only estimate breaks ties: prefer focal lengths close to it.
+        hits -= 0.02 * abs(np.log(f / f0))
+        if hits > best_hits:
+            best, best_hits = f, hits
+    if best is None or best_hits < 0.6:
+        return None
+    return float(best)
+
+
 def line_coverage(H: np.ndarray, mask: np.ndarray) -> float:
     """Fraction of the visible painted court lines (by image length) that have line pixels under them."""
     s = _Scorer(mask, step=0.05)
@@ -412,6 +486,8 @@ def calibrate_image(img: np.ndarray, focal_px: float | None = None) -> Calibrati
     scores = [_evaluate(Hc, mask) for Hc in options]
     H = options[int(np.argmax(scores))]
     H = _canonical(H, (w, h))
+    if focal_px is None:
+        focal_px = _focal_from_net(H, mask)
     pose = pose_from_homography(H, (w, h), focal_px)
     cal = Calibration(H / H[2, 2], (w, h), line_coverage(H, mask), pose)
     if pose.position[2] < 0.3:

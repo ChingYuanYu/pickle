@@ -118,6 +118,28 @@ def focal_consistency(H: np.ndarray, image_size: tuple[int, int]):
     return float(out[0]) if single else out
 
 
+def focal_residual_curve(H: np.ndarray, image_size: tuple[int, int]):
+    """Camera-consistency residual of a homography as a function of focal length (px)."""
+    w, h = image_size
+    Tinv = np.array([[1, 0, -w / 2.0], [0, 1, -h / 2.0], [0, 0, 1.0]])
+    A = Tinv @ np.asarray(H, dtype=np.float64)
+    u1, u2 = A[:2, 0] / w, A[:2, 1] / w
+    z1, z2 = A[2, 0], A[2, 1]
+    f = np.geomspace(0.25, 3.0, 400)
+    n1 = np.sqrt((u1 @ u1) / f ** 2 + z1 ** 2)
+    n2 = np.sqrt((u2 @ u2) / f ** 2 + z2 ** 2)
+    dot = (u1 @ u2) / f ** 2 + z1 * z2
+    with np.errstate(divide="ignore", invalid="ignore"):
+        e = np.hypot(dot / (n1 * n2), np.log(n1 / n2))
+    return f * w, np.nan_to_num(e, nan=10.0)
+
+
+def best_focal(H: np.ndarray, image_size: tuple[int, int]) -> float:
+    """Focal length (px) that makes the homography most consistent with a real camera."""
+    fs, e = focal_residual_curve(H, image_size)
+    return float(fs[int(np.argmin(e))])
+
+
 def consistency_weight(H, image_size):
     """Multiplier in (0, 1] applied to hypothesis scores."""
     e = focal_consistency(H, image_size)
@@ -130,7 +152,9 @@ def pose_from_homography(H: np.ndarray, image_size: tuple[int, int], focal_px: f
     cx, cy = w / 2.0, h / 2.0
     T = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1.0]])
     A = np.linalg.inv(T) @ H
-    f = focal_px or _focal_from_h(A, w)
+    if not np.isfinite(H).all():
+        raise ValueError("homography is not finite")
+    f = focal_px or best_focal(H, image_size)
     M = np.diag([1 / f, 1 / f, 1.0]) @ A
     lam = 1.0 / np.sqrt(np.linalg.norm(M[:, 0]) * np.linalg.norm(M[:, 1]))
     r1, r2, t = lam * M[:, 0], lam * M[:, 1], lam * M[:, 2]

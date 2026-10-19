@@ -124,6 +124,26 @@ def _cylinder(c, r, z0, z1, n=16):
     return np.vstack([np.hstack([ring, np.full((n, 1), z0)]), np.hstack([ring, np.full((n, 1), z1)])])
 
 
+def _draw_net(img, P):
+    """Posts, translucent mesh and white tape."""
+    for x in (-0.3, court.WIDTH + 0.3):
+        _poly(img, P, _cylinder((x, court.NET_Y), 0.04, 0, court.NET_HEIGHT_POST, 8), (30, 30, 30))
+    xs = np.linspace(-0.3, court.WIDTH + 0.3, 13)
+    for xa, xb in zip(xs[:-1], xs[1:]):
+        za = court.NET_HEIGHT_CENTER + (court.NET_HEIGHT_POST - court.NET_HEIGHT_CENTER) * abs(xa - court.CENTER_X) / court.CENTER_X
+        zb = court.NET_HEIGHT_CENTER + (court.NET_HEIGHT_POST - court.NET_HEIGHT_CENTER) * abs(xb - court.CENTER_X) / court.CENTER_X
+        _poly(img, P, [(xa, court.NET_Y, 0), (xb, court.NET_Y, 0), (xb, court.NET_Y, zb - 0.06), (xa, court.NET_Y, za - 0.06)], (25, 25, 25), 0.55)
+        _poly(img, P, [(xa, court.NET_Y, za - 0.06), (xb, court.NET_Y, zb - 0.06), (xb, court.NET_Y, zb), (xa, court.NET_Y, za)], (240, 240, 240))
+
+
+def _draw_player(img, P, p):
+    _poly(img, P, _cylinder((p.x + 0.25, p.y + 0.15), 0.3, 0, 0.001), (30, 50, 30), 0.35)   # shadow
+    _poly(img, P, _cylinder((p.x - 0.1, p.y), 0.08, 0, 0.85), (90, 80, 70))                  # legs
+    _poly(img, P, _cylinder((p.x + 0.1, p.y), 0.08, 0, 0.85), (90, 80, 70))
+    _poly(img, P, _cylinder((p.x, p.y), 0.22, 0.8, p.height - 0.25), p.shirt)                # torso
+    _poly(img, P, _cylinder((p.x, p.y), 0.11, p.height - 0.25, p.height), (120, 150, 200))   # head
+
+
 def render(view: View, scene: Scene | None = None, size=(1280, 720), seed: int = 0, background=None):
     """Render one frame. Returns (image BGR, H_true court->image, K, R, t)."""
     rng = np.random.default_rng(seed)
@@ -155,26 +175,25 @@ def render(view: View, scene: Scene | None = None, size=(1280, 720), seed: int =
         for y in np.arange(Y0 + 1, Y1, 3.0):
             for x in (X0 + 1, X1 - 1):
                 _poly(img, P, _cylinder((x, y), 0.04, 0, 3.0, 6), (60, 60, 60))
-        # Net: posts, translucent mesh and white tape.
-        for x in (-0.3, court.WIDTH + 0.3):
-            _poly(img, P, _cylinder((x, court.NET_Y), 0.04, 0, court.NET_HEIGHT_POST, 8), (30, 30, 30))
-        xs = np.linspace(-0.3, court.WIDTH + 0.3, 13)
-        for xa, xb in zip(xs[:-1], xs[1:]):
-            za = court.NET_HEIGHT_CENTER + (court.NET_HEIGHT_POST - court.NET_HEIGHT_CENTER) * abs(xa - court.CENTER_X) / court.CENTER_X
-            zb = court.NET_HEIGHT_CENTER + (court.NET_HEIGHT_POST - court.NET_HEIGHT_CENTER) * abs(xb - court.CENTER_X) / court.CENTER_X
-            _poly(img, P, [(xa, court.NET_Y, 0), (xb, court.NET_Y, 0), (xb, court.NET_Y, zb - 0.06), (xa, court.NET_Y, za - 0.06)], (25, 25, 25), 0.55)
-            _poly(img, P, [(xa, court.NET_Y, za - 0.06), (xb, court.NET_Y, zb - 0.06), (xb, court.NET_Y, zb), (xa, court.NET_Y, za)], (240, 240, 240))
+        _draw_net(img, P)
     else:
         img = background.copy()
 
-    # Players, far to near so nearer ones occlude.
+    # Players, far to near so nearer ones occlude; the net covers players on its far side.
     cam = -R.T @ t
-    for p in sorted(scene.players, key=lambda p: -np.hypot(p.x - cam[0], p.y - cam[1])):
-        _poly(img, P, _cylinder((p.x + 0.25, p.y + 0.15), 0.3, 0, 0.001), (30, 50, 30), 0.35)   # shadow
-        _poly(img, P, _cylinder((p.x - 0.1, p.y), 0.08, 0, 0.85), (90, 80, 70))                  # legs
-        _poly(img, P, _cylinder((p.x + 0.1, p.y), 0.08, 0, 0.85), (90, 80, 70))
-        _poly(img, P, _cylinder((p.x, p.y), 0.22, 0.8, p.height - 0.25), p.shirt)                # torso
-        _poly(img, P, _cylinder((p.x, p.y), 0.11, p.height - 0.25, p.height), (120, 150, 200))   # head
+    order = sorted(scene.players, key=lambda p: -np.hypot(p.x - cam[0], p.y - cam[1]))
+    beyond = [p for p in order if (p.y - court.NET_Y) * (cam[1] - court.NET_Y) < 0]
+    before = [p for p in order if p not in beyond]
+    if beyond:
+        layer = img.copy()
+        for p in beyond:
+            _draw_player(layer, P, p)
+        changed = (layer != img).any(-1)
+        netted = layer.copy()
+        _draw_net(netted, P)
+        img = np.where(changed[..., None], netted, layer)
+    for p in before:
+        _draw_player(img, P, p)
 
     if scene.blur > 1:
         img = cv2.GaussianBlur(img, (scene.blur | 1, scene.blur | 1), 0)
