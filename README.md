@@ -57,12 +57,18 @@ Low cameras (under about 2 m) lose the far players behind the net. That limit co
 
 ## Run it
 
+The environment is managed with [uv](https://docs.astral.sh/uv/). `uv sync` creates `.venv` from `uv.lock`.
+
 ```bash
-pip install -r requirements.txt
-python -m pbcoach.pipeline match.mp4 --out runs/match1            # YOLO people detector if available
-python -m pbcoach.pipeline match.mp4 --out runs/match1 --detector foreground --empty-court empty.jpg
-python -m pytest -q tests/test_core.py                               # 10 tests, about 30 s
+uv sync --extra yolo                                              # add the YOLO people detector (recommended for real footage)
+uv run pbcoach match.mp4 --out runs/match1                        # YOLO people detector if installed
+uv run pbcoach match.mp4 --out runs/match1 --detector foreground --empty-court empty.jpg
+uv run pytest -q tests/test_core.py                               # 10 tests, about 30 s
+uv run python -m tests.eval_calibration --seeds 4 --players       # angle-robustness benchmarks
+uv run python -m tests.eval_tracking
 ```
+
+Plain `uv sync` installs only the core dependencies (numpy, scipy, OpenCV) and pytest.
 
 Manual calibration file for `--points`:
 

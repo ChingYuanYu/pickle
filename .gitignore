@@ -4,3 +4,4 @@ runs/
 *.pt
 *.mp4
 .pytest_cache/
+.venv/

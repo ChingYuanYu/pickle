@@ -1,6 +1,0 @@
-numpy
-scipy
-opencv-python-headless
-# Optional, for the YOLO person detector on real footage (recommended):
-ultralytics
-pytest
