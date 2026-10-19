@@ -20,7 +20,7 @@ import numpy as np
 
 from . import court
 from .camera import CameraPose, best_focal, consistency_weight, focal_residual_curve, pose_from_homography, project, project_w
-from .lines import Line, detect_lines, group_by_vanishing_point, line_mask
+from .lines import Line, detect_lines, floor_mask, group_by_vanishing_point, line_mask
 
 
 @dataclass
@@ -478,7 +478,7 @@ def line_coverage(H: np.ndarray, mask: np.ndarray) -> float:
 def calibrate_image(img: np.ndarray, focal_px: float | None = None) -> Calibration | None:
     """Find the court in one image (or a median background frame)."""
     h, w = img.shape[:2]
-    mask = line_mask(img)
+    mask = line_mask(img) * floor_mask(img)
     lines = detect_lines(mask)
     fams = group_by_vanishing_point(lines)
     if len(fams) < 2:

@@ -40,36 +40,53 @@ The renderer (`pbcoach/synth.py`) adds a neighbouring court, yellow tennis lines
 
 | View | Mean position error | Player-frames found within 50 cm |
 | --- | --- | --- |
-| sideline_high | 0.10 m | 100% |
+| sideline_high | 0.11 m | 100% |
+| baseline_high | 0.23 m | 85% |
+| baseline_far_tripod | 0.31 m | 85% |
 | corner_high | 0.26 m | 84% |
-| overhead | 0.18 m | 86% |
-| baseline_far_tripod | 0.28 m | 83% |
-| baseline_high | 0.25 m | 83% |
-| sideline_low | 0.39 m | 80% |
-| near_half_zoom | 0.25 m | 63% |
+| overhead | 0.17 m | 83% |
+| sideline_low | 0.39 m | 81% |
+| near_half_zoom | 0.27 m | 64% |
 | baseline_offcenter | 0.26 m | 59% |
-| far_corner_fence | 0.27 m | 58% |
-| phone_tilted | 0.35 m | 56% |
-| corner_low | 0.30 m | 50% |
-| baseline_low | 0.52 m | 50% |
+| far_corner_fence | 0.28 m | 58% |
+| phone_tilted | 0.37 m | 55% |
+| baseline_low | 0.48 m | 53% |
+| corner_low | 0.40 m | 41% |
 
 Low cameras (under about 2 m) lose the far players behind the net. That limit comes from geometry, not tuning: the image only says the player is somewhere along a line of sight. **Mount the camera at least 3 m high** if you can.
 
 ## Demo app
 
-Upload a clip and see everything in the browser: the detected court and camera, the tracked video with a top-down minimap, heatmaps and paths per player, time behind the kitchen line, and coaching feedback you can ask follow-up questions about.
+Upload a clip and see everything in the browser:
+- **Replay:** an interactive 3D rebuild of the rally (posed players, ground rings, trails; orbit, camera presets, slow motion) next to the tracked video with pose skeletons and a top-down map.
+- **Coaching:** findings plus an "ask the coach" chat.
+- **Court & camera**, **Movement** (heatmaps, paths, distance behind the kitchen line) and **Numbers** (tables and downloads, including `replay.json`).
 
 ```bash
-uv sync --extra demo --extra yolo     # yolo is recommended for real footage
+uv sync --extra demo --extra yolo     # yolo adds the people and pose models, needed for real footage
 uv run pbcoach-demo                   # open http://localhost:7860 (add --share for a temporary public link)
 ```
 
 No footage at hand? Pick a camera angle and click **Load a synthetic sample rally**.
 
+If the detected court lines are off (very low cameras, unusual court colors), open **Fix the court**, pick a court point from the list and click where it is in the first frame. Four points that are not all on one line are enough, and points out of frame can be skipped.
+
 Coaching feedback comes from rules over the tracks (`pbcoach/coach.py`): time to reach the kitchen line, standing in the transition zone, partners split up and back, and partner spacing. With `ANTHROPIC_API_KEY` set, Claude also writes a short debrief and answers free-form questions. It sees only the computed numbers and findings, not the video. Set `PBCOACH_MODEL` to change the model.
 
+The 3D view loads three.js from cdn.jsdelivr.net, so the browser needs internet access.
+
+![Demo: 3D replay](docs/demo_replay3d.png)
 ![Demo: coaching tab](docs/demo_coaching.png)
 ![Demo: movement tab](docs/demo_movement.png)
+
+### How far players are tracked
+
+From a camera at head height, one pixel on the far side of the court can span most of a meter, and the net hides feet. The tracker accounts for that:
+- A second, zoomed YOLO pass over the far court finds small players; pose comes from each person's enlarged crop.
+- Feet come from the ankles when visible; people cut off by the frame edge are placed from their head height instead.
+- Each position carries its own uncertainty (meters per pixel at that spot), fused with the distance implied by the person's apparent height, so far players are smoothed hard and near players stay precise.
+- Doubles has two players per side and nobody crosses the net mid-rally: a side never holds more than two identities, and a lost player is re-acquired by shirt color instead of getting a new ID.
+- Paths are smoothed offline (running median, then Gaussian) before metrics and the replay.
 
 ## Run it
 
@@ -109,11 +126,13 @@ Keypoint names are listed in `pbcoach/court.py` (`KEYPOINTS`).
 | `pbcoach/coach.py` | Rule-based coaching findings, optional Claude debrief and Q&A |
 | `pbcoach/report.py` | Heatmaps, paths and kitchen-line distance series |
 | `pbcoach/demo.py` | Gradio web demo (`pbcoach-demo`) |
+| `pbcoach/replay3d.py` | Self-contained three.js 3D replay page |
 | `pbcoach/synth.py` | Synthetic multi-angle renderer used by the tests |
 
 ## Not yet validated
 
-- **Real footage.** Every number above comes from synthetic renders. The YOLO path runs, but it has not been scored on real players. The next step is a few real clips from different angles, hand-labelled for player positions.
+- **Real footage.** The numbers above come from synthetic renders. One real indoor clip (camera about 1.7 m high behind a corner, low resolution) now tracks all four players with steady identities, but far-side positions there are still only good to about a meter, and automatic court finding needed hand-placed points. Hand-labelled real clips from several angles are the next step.
 - **Lens distortion.** GoPro and phone ultra-wide lenses bend court lines. A distortion parameter is needed in the line fit.
 - **Moving cameras.** The prototype assumes a fixed tripod. A handheld phone needs re-calibration per segment.
+- **3D poses** are a single-camera approximation: each 2D skeleton is stood upright in a plane facing the camera, so limbs pointing at the camera come out flattened.
 - **Ball tracking and shots.** These are stage 3 of the design and not started.

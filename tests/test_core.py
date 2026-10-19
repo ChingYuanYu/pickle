@@ -94,3 +94,49 @@ def test_coach_flags_split_partners_and_praises_spacing():
     assert ("Near team", "Partners split up and back") in titles
     assert ("Player 2", "Never reached the kitchen line") in titles
     assert ("Player 1", "Gets to the kitchen line") in titles
+
+
+def test_far_positions_are_trusted_less_from_a_low_camera():
+    from pbcoach.players import ground_covariance
+    img, *_ = synth.render(_view("baseline_low"), synth.Scene(), seed=0)
+    cal = calibrate_from_points(project(synth_H("baseline_low"), [court.KEYPOINTS[n] for n in CORNERS]), CORNERS,
+                                (img.shape[1], img.shape[0]))
+    near = ground_covariance(cal, cal.to_image([(3.0, 2.0)])[0], 2.0)
+    far = ground_covariance(cal, cal.to_image([(3.0, 11.0)])[0], 2.0)
+    assert np.trace(far) > 10 * np.trace(near)
+
+
+def test_tracker_keeps_sides_and_reacquires_lost_player():
+    tr = CourtTracker(fps=10)
+    d = lambda x, y, f=None: Detection((0, 0, 1, 1), 0.9, court_xy=np.array([x, y]), cov=np.eye(2) * 0.01, feat=f)
+    red, blue = np.r_[1.0, 0, 0], np.r_[0, 0, 1.0]
+    for f in range(10):
+        tr.update([d(1.0, 2.0, red), d(4.0, 2.0, blue), d(2.0, 11.0), d(4.0, 11.0)], f)
+    ids = {round(t.pos[0]): t.id for t in tr.tracks if t.side == "near"}
+    for f in range(10, 40):   # the red player is unseen for 3 s, then reappears elsewhere on the near side
+        tr.update([d(4.0, 2.0, blue), d(2.0, 11.0), d(4.0, 11.0)], f)
+    tracks = tr.update([d(2.5, 1.0, red), d(4.0, 2.0, blue), d(2.0, 11.0), d(4.0, 11.0), d(3.0, 3.0, red * 0 + 0.3)], 40)
+    near = {t.id: t for t in tracks if t.side == "near"}
+    assert set(near) == {ids[1], ids[4]}                      # no third near-side identity
+    assert np.allclose(near[ids[1]].pos, (2.5, 1.0), atol=0.3)  # re-acquired by appearance
+    assert len(tr.tracks) == 4
+
+
+def test_lifted_pose_stands_upright_on_the_player():
+    from pbcoach.players import lift_keypoints
+    img, H, K, R, t = synth.render(_view("corner_high"), synth.Scene(), seed=0)
+    cal = calibrate_from_points(project(H, [court.KEYPOINTS[n] for n in CORNERS]), CORNERS,
+                                (img.shape[1], img.shape[0]))
+    g = np.array([2.0, 4.0])
+    heights = np.array([0.05, 0.5, 1.0, 1.5, 1.7])
+    kp = np.c_[cal.pose.project3d(np.c_[np.tile(g, (5, 1)), heights]), np.ones(5)]
+    J = lift_keypoints(cal, kp, g)
+    assert np.allclose(J[:, 2], heights, atol=0.08)
+    assert np.allclose(J[:, :2], g, atol=0.1)
+
+
+CORNERS = ["near_left", "near_right", "far_right", "far_left"]
+
+
+def synth_H(name):
+    return synth.render(_view(name), synth.Scene(), seed=0)[1]
