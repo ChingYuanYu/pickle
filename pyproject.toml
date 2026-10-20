@@ -13,9 +13,15 @@ dependencies = [
 [project.optional-dependencies]
 # YOLO person detector for real footage (recommended)
 yolo = ["ultralytics"]
+demo = [
+    "anthropic>=1.15.0",
+    "gradio>=6.30.0",
+    "imageio-ffmpeg>=0.6.0",
+]
 
 [project.scripts]
 pbcoach = "pbcoach.pipeline:main"
+pbcoach-demo = "pbcoach.demo:main"
 
 [dependency-groups]
 dev = ["pytest"]

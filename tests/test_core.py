@@ -74,3 +74,88 @@ def test_tracker_keeps_ids():
         tracks = tr.update(dets, f)
     assert sorted(t.id for t in tracks) == [1, 2]
     assert {t.team for t in tracks} == {"near", "far"}
+
+
+def _rows(positions, fps=10):
+    """Tracker-style rows from {player_id: (team, [(x, y), ...])}."""
+    return [{"frame": f, "t": f / fps, "player_id": pid, "team": team, "x": x, "y": y}
+            for pid, (team, path) in positions.items() for f, (x, y) in enumerate(path)]
+
+
+def test_coach_flags_split_partners_and_praises_spacing():
+    from pbcoach import coach
+    n = 60
+    up = [(1.5, court.NVZ_NEAR_Y - 0.3)] * n          # at the kitchen line
+    back = [(4.5, 0.5)] * n                            # stays on the baseline
+    ghost = [(3.0, 3.0)] * 3                           # too short to be a player
+    rows = _rows({1: ("near", up), 2: ("near", back), 9: ("near", ghost)})
+    assert coach.player_ids(rows) == {1, 2}
+    titles = {(i.who.split(" (")[0], i.title) for i in coach.analyze(rows, {"calibration": {"score": 1.0}}, 10)}
+    assert ("Near team", "Partners split up and back") in titles
+    assert ("Player 2", "Never reached the kitchen line") in titles
+    assert ("Player 1", "Gets to the kitchen line") in titles
+
+
+def test_far_positions_are_trusted_less_from_a_low_camera():
+    from pbcoach.players import ground_covariance
+    img, *_ = synth.render(_view("baseline_low"), synth.Scene(), seed=0)
+    cal = calibrate_from_points(project(synth_H("baseline_low"), [court.KEYPOINTS[n] for n in CORNERS]), CORNERS,
+                                (img.shape[1], img.shape[0]))
+    near = ground_covariance(cal, cal.to_image([(3.0, 2.0)])[0], 2.0)
+    far = ground_covariance(cal, cal.to_image([(3.0, 11.0)])[0], 2.0)
+    assert np.trace(far) > 10 * np.trace(near)
+
+
+def test_tracker_keeps_sides_and_reacquires_lost_player():
+    tr = CourtTracker(fps=10)
+    d = lambda x, y, f=None: Detection((0, 0, 1, 1), 0.9, court_xy=np.array([x, y]), cov=np.eye(2) * 0.01, feat=f)
+    red, blue = np.r_[1.0, 0, 0], np.r_[0, 0, 1.0]
+    for f in range(10):
+        tr.update([d(1.0, 2.0, red), d(4.0, 2.0, blue), d(2.0, 11.0), d(4.0, 11.0)], f)
+    ids = {round(t.pos[0]): t.id for t in tr.tracks if t.side == "near"}
+    for f in range(10, 40):   # the red player is unseen for 3 s, then reappears elsewhere on the near side
+        tr.update([d(4.0, 2.0, blue), d(2.0, 11.0), d(4.0, 11.0)], f)
+    tracks = tr.update([d(2.5, 1.0, red), d(4.0, 2.0, blue), d(2.0, 11.0), d(4.0, 11.0), d(3.0, 3.0, red * 0 + 0.3)], 40)
+    near = {t.id: t for t in tracks if t.side == "near"}
+    assert set(near) == {ids[1], ids[4]}                      # no third near-side identity
+    assert np.allclose(near[ids[1]].pos, (2.5, 1.0), atol=0.3)  # re-acquired by appearance
+    assert len(tr.tracks) == 4
+
+
+def test_lifted_pose_stands_upright_on_the_player():
+    from pbcoach.players import lift_keypoints
+    img, H, K, R, t = synth.render(_view("corner_high"), synth.Scene(), seed=0)
+    cal = calibrate_from_points(project(H, [court.KEYPOINTS[n] for n in CORNERS]), CORNERS,
+                                (img.shape[1], img.shape[0]))
+    g = np.array([2.0, 4.0])
+    heights = np.array([0.05, 0.5, 1.0, 1.5, 1.7])
+    kp = np.c_[cal.pose.project3d(np.c_[np.tile(g, (5, 1)), heights]), np.ones(5)]
+    J = lift_keypoints(cal, kp, g)
+    assert np.allclose(J[:, 2], heights, atol=0.08)
+    assert np.allclose(J[:, :2], g, atol=0.1)
+
+
+def test_pose_smoothing_steadies_joints_without_lagging_the_player():
+    from pbcoach.pose import smooth_track
+    rng = np.random.default_rng(0)
+    fps, n, h = 30.0, 60, 80.0
+    x0 = np.linspace(100, 400, n)                      # running fast across the image: 10 px per frame
+    rel = rng.uniform(-0.3, 0.3, (17, 2)) * h            # a fixed pose relative to the box
+    truth = np.stack([np.c_[x0[i] + rel[:, 0], 300 + rel[:, 1]] for i in range(n)])
+    kps = [np.c_[truth[i] + rng.normal(0, 2.0, (17, 2)), np.full(17, 0.9)] for i in range(n)]
+    kps[30][9, :2] += 40                                  # one wrist jumps to a wrong place
+    kps[40][9, 2] = 0.05                                  # and drops out for a frame
+    boxes = [(x0[i] - 25, 300 - h / 2, x0[i] + 25, 300 + h / 2) for i in range(n)]
+    out = smooth_track(kps, boxes, fps)
+    err_raw = np.median([np.linalg.norm(k[:, :2] - t, axis=1).mean() for k, t in zip(kps, truth)])
+    err = np.median([np.linalg.norm(k[:, :2] - t, axis=1).mean() for k, t in zip(out, truth)])
+    assert err < 0.6 * err_raw
+    assert np.linalg.norm(out[30][9, :2] - truth[30][9]) < 6     # outlier removed
+    assert out[40][9, 2] >= 0.3 and np.linalg.norm(out[40][9, :2] - truth[40][9]) < 6   # dropout bridged
+
+
+CORNERS = ["near_left", "near_right", "far_right", "far_left"]
+
+
+def synth_H(name):
+    return synth.render(_view(name), synth.Scene(), seed=0)[1]

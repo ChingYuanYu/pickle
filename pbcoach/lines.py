@@ -38,7 +38,9 @@ def line_mask(img: np.ndarray, max_line_px: int | None = None, max_saturation: f
     max_line_px = max_line_px or max(9, int(0.025 * max(h, w)) | 1)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max_line_px, max_line_px))
     tophat = cv2.morphologyEx(L, cv2.MORPH_TOPHAT, k)
-    thr = max(18.0, float(np.percentile(tophat, 96)))
+    # Cap the adaptive threshold: cluttered indoor scenes (lights, wall ribs) push the
+    # percentile above the contrast of real court lines.
+    thr = float(np.clip(np.percentile(tophat, 96), 18.0, 30.0))
     mask = (tophat > thr).astype(np.uint8) * 255
     if max_saturation is not None:
         # A white line blended into the surface only shrinks the surface's chroma toward
@@ -58,6 +60,39 @@ def line_mask(img: np.ndarray, max_line_px: int | None = None, max_saturation: f
     mask[blobs > 0] = 0
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     return mask
+
+
+def floor_mask(img: np.ndarray, k: int = 4) -> np.ndarray:
+    """Rough mask of the ground: what is left after removing the colors of the image top.
+
+    The top of a court video is sky, walls, ceiling or lights, which in real indoor footage
+    produce more line-like structure than the court itself. Pixels colored like the top rows
+    are dropped, then the remaining regions touching the bottom edge are kept with their
+    convex hull (which fills players, lines and the net). Returns a uint8 mask (1 = ground),
+    or all ones when that leaves no plausible ground region (an overhead view, for example).
+    """
+    h, w = img.shape[:2]
+    lab = cv2.cvtColor(cv2.GaussianBlur(img, (5, 5), 0), cv2.COLOR_BGR2LAB).astype(np.float32)
+    small = cv2.resize(lab, (160, max(8, int(160 * h / w))), interpolation=cv2.INTER_AREA)
+    sh = small.shape[0]
+    top = small[: max(2, int(0.2 * sh))].reshape(-1, 3)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, lbl, cen = cv2.kmeans(top, k, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+    cen = cen[np.bincount(lbl.ravel(), minlength=k) / len(lbl) > 0.05]
+    d = np.min(np.linalg.norm(small[:, :, None, :] - cen[None, None], axis=-1), axis=-1)
+    m = cv2.morphologyEx((d > 18).astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    n, cc, st, _ = cv2.connectedComponentsWithStats(m)
+    keep = np.zeros_like(m)
+    for i in range(1, n):  # large regions that reach the bottom edge
+        if st[i, cv2.CC_STAT_AREA] > 0.03 * m.size and st[i, cv2.CC_STAT_TOP] + st[i, cv2.CC_STAT_HEIGHT] >= sh - 2:
+            keep[cc == i] = 1
+    if keep.sum() < 0.15 * keep.size:
+        return np.ones((h, w), np.uint8)
+    hull = np.zeros_like(keep)
+    for c in cv2.findContours(keep, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        cv2.fillPoly(hull, [cv2.convexHull(c)], 1)
+    hull = cv2.dilate(hull, np.ones((5, 5), np.uint8))
+    return cv2.resize(hull, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
 def _seg_to_abc(x1, y1, x2, y2) -> np.ndarray:

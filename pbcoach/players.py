@@ -26,6 +26,33 @@ class Detection:
     foot_px: np.ndarray | None = None        # image foot point
     court_xy: np.ndarray | None = None       # meters
     mask: np.ndarray | None = None           # optional blob pixels (N, 2) as x, y
+    cov: np.ndarray | None = None            # 2x2 court-position covariance (m^2)
+    keypoints: np.ndarray | None = None      # optional (17, 3) COCO pose: x, y, confidence
+    feat: np.ndarray | None = None           # optional appearance (clothing color histogram)
+
+
+def appearance(frame: np.ndarray, d: Detection) -> np.ndarray | None:
+    """Hue-saturation histogram of the torso and shorts: what tells two players apart."""
+    x1, y1, x2, y2 = d.box
+    bw, bh = x2 - x1, y2 - y1
+    x1, x2 = int(x1 + 0.2 * bw), int(x2 - 0.2 * bw)
+    y1, y2 = int(y1 + 0.2 * bh), int(y1 + 0.65 * bh)
+    patch = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+    if patch.size < 12:
+        return None
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    # Dark and washed-out pixels have unreliable hue: count them by brightness instead.
+    h = cv2.calcHist([hsv], [0, 1], (hsv[..., 2] > 50).astype(np.uint8), [12, 4], [0, 180, 40, 256]).ravel()
+    v = cv2.calcHist([hsv], [2], None, [4], [0, 256]).ravel()
+    f = np.concatenate([h, v * 0.5]).astype(np.float32)
+    return f / max(float(f.sum()), 1e-6)
+
+
+def appearance_distance(a, b) -> float:
+    """Bhattacharyya distance in [0, 1]; 0 when either side is unknown."""
+    if a is None or b is None:
+        return 0.0
+    return float(np.sqrt(max(0.0, 1.0 - np.sum(np.sqrt(a * b)))))
 
 
 # ---------------------------------------------------------------- geometry
@@ -54,6 +81,26 @@ def foot_from_box(cal: Calibration, box) -> np.ndarray:
     return c + d * t
 
 
+def foot_from_keypoints(cal: Calibration, kp: np.ndarray | None, box, min_conf: float = 0.4):
+    """Ground point below the visible ankles, or None when no ankle is trusted.
+
+    Ankles are tighter than a box bottom, which grows with shadows, a stretched leg or the
+    box detector's padding, and that matters most for small far players.
+    """
+    if kp is None:
+        return None
+    ank = kp[[15, 16]]
+    ank = ank[ank[:, 2] >= min_conf]
+    if not len(ank):
+        return None
+    p = ank[:, :2].mean(0)
+    if p[1] > box[3] + 2 or p[1] < box[1]:
+        return None
+    # The ankle joint sits ~8 cm above the floor: about 5% of the person's height, straight down.
+    u = up_direction(cal, p)
+    return p - u * 0.05 * (box[3] - box[1])
+
+
 def foot_from_blob(cal: Calibration, pts: np.ndarray) -> np.ndarray:
     """Lowest part of a blob along the local world-down direction."""
     c = pts.mean(0)
@@ -66,6 +113,52 @@ def foot_from_blob(cal: Calibration, pts: np.ndarray) -> np.ndarray:
     return c
 
 
+def ground_covariance(cal: Calibration, foot_px, sigma_px: float) -> np.ndarray:
+    """Court-position covariance of a foot point known to +-sigma_px pixels.
+
+    One pixel is a few centimeters near a high camera but can be most of a meter on the far
+    side of a low one, so the tracker must trust far measurements much less.
+    """
+    f = np.asarray(foot_px, dtype=np.float64)
+    pts = cal.to_court([f, f + (1.0, 0.0), f + (0.0, 1.0)])
+    J = np.stack([pts[1] - pts[0], pts[2] - pts[0]], axis=1)    # meters per pixel
+    if not np.isfinite(J).all():
+        return np.eye(2) * 25.0
+    return sigma_px ** 2 * J @ J.T + np.eye(2) * 0.05 ** 2
+
+
+def lift_keypoints(cal: Calibration, keypoints: np.ndarray, ground_xy, height_m: float = 1.75) -> np.ndarray:
+    """3D joints (court meters, z up) from 2D pose keypoints of a person standing at ground_xy.
+
+    One camera cannot see depth across the body, so the 2D pose is stood upright in the plane
+    through the player that faces the camera, scaled by how tall a person looks at that spot.
+    Good enough for a replay figure; limbs pointing at the camera come out flattened.
+    """
+    g = np.asarray(ground_xy, dtype=np.float64)
+    foot = cal.to_image([g])[0]
+    up = up_direction(cal, foot)
+    side = np.array([-up[1], up[0]])
+    m_per_px = height_m / max(expected_height_px(cal, g, height_m), 1e-6)
+    C = np.asarray(cal.pose.position, dtype=np.float64)
+    toward = C[:2] - g
+    toward /= max(np.linalg.norm(toward), 1e-9)
+    lateral = np.array([toward[1], -toward[0]])     # image-right direction on the ground
+    if (cal.to_image([g + lateral])[0] - foot) @ side < 0:
+        lateral = -lateral
+    d = keypoints[:, :2] - foot
+    z = np.clip((d @ up) * m_per_px, 0.0, 2.4)
+    xy = g + np.outer((d @ side) * m_per_px, lateral)
+    return np.c_[xy, z]
+
+
+def ground_from_head(cal: Calibration, head_px, head_m: float = 1.65):
+    """Ground position of a person whose feet are out of frame, from where their head is."""
+    pose = cal.pose
+    Hh = pose.K @ np.stack([pose.R[:, 0], pose.R[:, 1], head_m * pose.R[:, 2] + pose.t], axis=1)
+    p = np.linalg.solve(Hh, np.array([head_px[0], head_px[1], 1.0]))
+    return p[:2] / p[2] if abs(p[2]) > 1e-12 else None
+
+
 def expected_height_px(cal: Calibration, court_xy, height_m: float = 1.75) -> float:
     a = cal.pose.project3d([(court_xy[0], court_xy[1], 0.0)])[0]
     b = cal.pose.project3d([(court_xy[0], court_xy[1], height_m)])[0]
@@ -74,21 +167,109 @@ def expected_height_px(cal: Calibration, court_xy, height_m: float = 1.75) -> fl
 
 # ---------------------------------------------------------------- detectors
 
-class YoloDetector:
-    """Ultralytics YOLO person detector (downloads weights on first use)."""
+def _nms(dets: list[Detection], iou: float = 0.5) -> list[Detection]:
+    keep: list[Detection] = []
+    for d in sorted(dets, key=lambda d: -d.conf):
+        x1, y1, x2, y2 = d.box
+        ok = True
+        for k in keep:
+            a1, b1, a2, b2 = k.box
+            iw, ih = max(0.0, min(x2, a2) - max(x1, a1)), max(0.0, min(y2, b2) - max(y1, b1))
+            inter = iw * ih
+            small = min((x2 - x1) * (y2 - y1), (a2 - a1) * (b2 - b1))
+            union = (x2 - x1) * (y2 - y1) + (a2 - a1) * (b2 - b1) - inter
+            if (union > 0 and inter / union > iou) or (small > 0 and inter / small > 0.8):
+                ok = False
+                break
+        if ok:
+            keep.append(d)
+    return keep
 
-    def __init__(self, weights: str = "yolov8n.pt", conf: float = 0.25, imgsz: int = 1280):
+
+class YoloDetector:
+    """Ultralytics YOLO people detector with a zoomed second look at the far court, plus pose.
+
+    Far players can be a few dozen pixels tall. When a calibration is given, the region where
+    far-side players can appear is cropped, enlarged and searched again, and the results are
+    merged. Pose keypoints come from running a pose model on each person's enlarged crop,
+    which finds far players' joints far more reliably than whole-frame pose detection.
+    Weights download on first use.
+    """
+
+    def __init__(self, weights: str = "yolov8n.pt", conf: float = 0.25, cal: Calibration | None = None,
+                 pose_weights: str | None = "yolov8n-pose.pt"):
         from ultralytics import YOLO
         self.model = YOLO(weights)
+        self.pose = YOLO(pose_weights) if pose_weights else None
         self.conf = conf
-        self.imgsz = imgsz
+        self.cal = cal
+        self._roi = None
+
+    def _far_roi(self, w: int, h: int):
+        if self._roi is None and self.cal is not None:
+            xs, ys = np.meshgrid([-1.5, court.WIDTH / 2, court.WIDTH + 1.5], [court.NET_Y, court.LENGTH + 2.5])
+            g = np.stack([xs.ravel(), ys.ravel()], 1)
+            pts = np.concatenate([self.cal.pose.project3d(np.c_[g, np.full(len(g), z)]) for z in (0.0, 2.2)])
+            if np.isfinite(pts).all():
+                x1, y1 = np.clip(pts.min(0) - 10, 0, (w, h)).astype(int)
+                x2, y2 = np.clip(pts.max(0) + 10, 0, (w, h)).astype(int)
+                if x2 - x1 > 32 and y2 - y1 > 16 and (x2 - x1) * (y2 - y1) < 0.35 * w * h:
+                    self._roi = (x1, y1, x2, y2)
+            self._roi = self._roi or ()
+        return self._roi
+
+    def _detect(self, img, imgsz, offset=(0, 0), scale=1.0) -> list[Detection]:
+        r = self.model.predict(img, classes=[0], conf=self.conf, imgsz=imgsz, verbose=False)[0]
+        ox, oy = offset
+        return [Detection((ox + x1 / scale, oy + y1 / scale, ox + x2 / scale, oy + y2 / scale), float(c))
+                for (x1, y1, x2, y2), c in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy())]
 
     def __call__(self, frame: np.ndarray) -> list[Detection]:
-        r = self.model.predict(frame, classes=[0], conf=self.conf, imgsz=self.imgsz, verbose=False)[0]
-        out = []
-        for (x1, y1, x2, y2), c in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy()):
-            out.append(Detection((float(x1), float(y1), float(x2), float(y2)), float(c)))
-        return out
+        h, w = frame.shape[:2]
+        imgsz = int(min(1280, -(-max(h, w) // 32) * 32))   # never upsample the whole frame
+        dets = self._detect(frame, imgsz)
+        roi = self._far_roi(w, h)
+        if roi:
+            x1, y1, x2, y2 = roi
+            scale = min(3.0, 640.0 / (x2 - x1))
+            if scale > 1.2:
+                crop = cv2.resize(frame[y1:y2, x1:x2], None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                # People cut by the crop's edge are half-boxes of someone the full frame already has.
+                inner = [d for d in self._detect(crop, 640, (x1, y1), scale)
+                         if (d.box[0] > x1 + 2 or x1 == 0) and (d.box[2] < x2 - 2 or x2 == w)
+                         and (d.box[3] < y2 - 2 or y2 == h) and (d.box[1] > y1 + 2 or y1 == 0)]
+                dets = _nms(dets + inner)
+        if self.pose is not None and dets:
+            self._add_pose(frame, dets)
+        for d in dets:
+            d.feat = appearance(frame, d)
+        return dets
+
+    def _add_pose(self, frame: np.ndarray, dets: list[Detection], target_h: int = 256):
+        h, w = frame.shape[:2]
+        crops, meta = [], []
+        for d in dets:
+            x1, y1, x2, y2 = d.box
+            bw, bh = x2 - x1, y2 - y1
+            cx1, cy1 = int(max(0, x1 - 0.25 * bw)), int(max(0, y1 - 0.1 * bh))
+            cx2, cy2 = int(min(w, x2 + 0.25 * bw)), int(min(h, y2 + 0.1 * bh))
+            if cx2 - cx1 < 4 or cy2 - cy1 < 8:
+                continue
+            s = max(1.0, target_h / (cy2 - cy1))
+            crops.append(cv2.resize(frame[cy1:cy2, cx1:cx2], None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC))
+            meta.append((d, cx1, cy1, s))
+        if not crops:
+            return
+        for (d, cx1, cy1, s), r in zip(meta, self.pose.predict(crops, conf=0.2, imgsz=320, verbose=False)):
+            if r.keypoints is None or len(r.boxes) == 0:
+                continue
+            # The person this box is about is the one whose box best matches the crop's center.
+            b = r.boxes.xyxy.cpu().numpy() / s + (cx1, cy1, cx1, cy1)
+            c = np.array([(d.box[0] + d.box[2]) / 2, (d.box[1] + d.box[3]) / 2])
+            i = int(np.argmin(np.linalg.norm((b[:, :2] + b[:, 2:]) / 2 - c, axis=1)))
+            kp = r.keypoints.data[i].cpu().numpy().astype(np.float64)
+            kp[:, :2] = kp[:, :2] / s + (cx1, cy1)
+            d.keypoints = kp
 
 
 class ForegroundDetector:
@@ -256,16 +437,31 @@ def _cylinder_pts(c, r, z0, z1, n=16):
 
 def locate(cal: Calibration, dets: list[Detection], margin_m: float = 2.0,
            size_range=(0.35, 1.8)) -> list[Detection]:
-    """Attach foot points and court positions; drop people off court or of implausible size."""
+    """Attach foot points, court positions and their uncertainty; drop people off court or of implausible size."""
     kept = []
     for d in dets:
         if d.court_xy is not None:  # already located on the ground (occupancy detector)
+            if d.cov is None:
+                d.cov = np.eye(2) * 0.1 ** 2
             kept.append(d)
             continue
-        d.foot_px = foot_from_blob(cal, d.mask) if d.mask is not None else foot_from_box(cal, d.box)
+        if d.mask is not None:
+            d.foot_px = foot_from_blob(cal, d.mask)
+        else:
+            d.foot_px = foot_from_keypoints(cal, d.keypoints, d.box)
+            if d.foot_px is None:
+                d.foot_px = foot_from_box(cal, d.box)
         d.court_xy = cal.to_court([d.foot_px])[0]
-        x, y = d.court_xy
-        if not (-margin_m <= x <= court.WIDTH + margin_m and -margin_m <= y <= court.LENGTH + margin_m):
+        cut = d.mask is None and d.box[3] >= cal.image_size[1] - 3 and (
+            d.keypoints is None or (d.keypoints[[15, 16], 2] < 0.4).all())
+        if cut:  # feet below the frame edge: the box bottom is not the feet, the head still is the head
+            kp = d.keypoints
+            head = kp[0, :2] if kp is not None and kp[0, 2] >= 0.4 else ((d.box[0] + d.box[2]) / 2, d.box[1])
+            g = ground_from_head(cal, head, 1.6 if kp is not None and kp[0, 2] >= 0.4 else 1.72)
+            if g is not None and np.isfinite(g).all():
+                d.court_xy = g
+                d.foot_px = cal.to_image([g])[0]
+        if not np.isfinite(d.court_xy).all():
             continue
         exp_h = expected_height_px(cal, d.court_xy)
         u = up_direction(cal, d.foot_px)
@@ -277,8 +473,40 @@ def locate(cal: Calibration, dets: list[Detection], margin_m: float = 2.0,
             extent = float(np.ptp(corners @ u))
         if exp_h > 0 and not (size_range[0] * exp_h <= extent <= size_range[1] * exp_h * 1.6):
             continue
+        # Feet are found to within a few percent of the person's image height.
+        d.cov = ground_covariance(cal, d.foot_px, max(1.5, 0.03 * extent))
+        if not cut and d.mask is None and d.box[1] > 2 and exp_h > 0:
+            _fuse_height(cal, d, extent, exp_h)
+        x, y = d.court_xy
+        if not (-margin_m <= x <= court.WIDTH + margin_m and -margin_m <= y <= court.LENGTH + margin_m):
+            continue
         kept.append(d)
     return kept
+
+
+def _fuse_height(cal: Calibration, d: Detection, height_px: float, expected_px: float, rel_sd: float = 0.08):
+    """Blend the foot-point distance with the distance implied by how tall the person looks.
+
+    From a low camera the far players' feet sit where one pixel spans most of a meter, while
+    their apparent height still says roughly how far away they are (people are 1.75 m give
+    or take ~8%). Both estimates are combined along the camera's line of sight, weighted by
+    their uncertainties, so near players keep their precise foot point.
+    """
+    C = np.asarray(cal.pose.position[:2], dtype=np.float64)
+    g = d.court_xy
+    r = float(np.linalg.norm(g - C))
+    if r < 1e-6:
+        return
+    u = (g - C) / r
+    var_foot = float(u @ d.cov @ u)
+    r_h = r * expected_px * (1.7 / 1.75) / height_px   # apparent size falls off with distance
+    var_h = (rel_sd * r_h) ** 2
+    w = var_h / (var_h + var_foot)
+    r_new = w * r + (1 - w) * r_h
+    d.court_xy = C + u * r_new
+    var_new = var_foot * var_h / (var_foot + var_h)
+    n = np.array([-u[1], u[0]])
+    d.cov = var_new * np.outer(u, u) + float(n @ d.cov @ n) * np.outer(n, n)
 
 
 # ---------------------------------------------------------------- tracking
@@ -288,6 +516,9 @@ class Track:
     id: int
     x: np.ndarray                      # state: x, y, vx, vy
     P: np.ndarray
+    side: str = "near"                 # side of the net the track started on
+    det: Detection | None = None       # detection matched in the latest frame, if any
+    feat: np.ndarray | None = None     # running appearance
     hits: int = 1
     misses: int = 0
     history: list = field(default_factory=list)
@@ -298,68 +529,113 @@ class Track:
 
     @property
     def team(self) -> str:
-        return "near" if self.x[1] < court.NET_Y else "far"
+        return self.side
+
+
+def _side(xy) -> str:
+    return "near" if xy[1] < court.NET_Y else "far"
 
 
 class CourtTracker:
-    """Constant-velocity Kalman tracks on the court plane with Hungarian assignment."""
+    """Constant-velocity Kalman tracks on the court plane with Hungarian assignment.
 
-    def __init__(self, fps: float, max_players: int = 4, gate_m: float = 1.5, max_misses: int | None = None):
+    Each detection carries its own position covariance, so a far player seen by a low camera
+    (where one pixel is most of a meter) is smoothed hard and gated loosely, while a near
+    player is followed closely. Doubles has two players per side, so a side never holds more
+    than two tracks: a detection that cannot be matched re-acquires that side's lost player
+    instead of starting a new identity.
+    """
+
+    def __init__(self, fps: float, max_players: int = 4, gate_m: float = 1.5, max_misses: int | None = None,
+                 per_side: int | None = None):
         self.dt = 1.0 / fps
         self.max_players = max_players
+        self.per_side = per_side or max(1, max_players // 2)
         self.gate = gate_m
         self.max_misses = max_misses or int(2 * fps)
         self.coast = max(1, int(0.5 * fps))
+        self.min_hits = max(3, int(fps))
         self.tracks: list[Track] = []
         self.next_id = 1
         dt = self.dt
         self.F = np.array([[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1.0]])
-        self.Q = np.diag([0.01, 0.01, 1.0, 1.0]) * dt
+        self.Q = np.diag([0.01, 0.01, 4.0, 4.0]) * dt   # players accelerate hard
         self.Hm = np.array([[1, 0, 0, 0], [0, 1, 0, 0.0]])
         self.R = np.eye(2) * 0.05 ** 2
+
+    def _R(self, d: Detection) -> np.ndarray:
+        return d.cov if d.cov is not None else self.R
+
+    def _cost(self, t: Track, d: Detection) -> float:
+        """Mahalanobis distance, floored so that tiny covariances still allow normal motion."""
+        if _side(d.court_xy) != t.side:
+            return np.inf   # players stay on their side of the net during a rally
+        S = self.Hm @ t.P @ self.Hm.T + self._R(d) + np.eye(2) * (self.gate / 3) ** 2
+        r = d.court_xy - t.pos
+        # Looking different costs as much as being three standard deviations away.
+        return float(np.sqrt(r @ np.linalg.solve(S, r))) + 6.0 * appearance_distance(t.feat, d.feat)
 
     def update(self, dets: list[Detection], frame_idx: int) -> list[Track]:
         for t in self.tracks:
             t.x = self.F @ t.x
             t.P = self.F @ t.P @ self.F.T + self.Q
-        Z = np.array([d.court_xy for d in dets]) if dets else np.zeros((0, 2))
+            if t.misses > self.coast:   # long unseen: stop growing, never more uncertain than ~3 m
+                t.P = np.diag([min(t.P[0, 0], 9.0), min(t.P[1, 1], 9.0), 1.0, 1.0])
+            t.det = None
         assigned_t, assigned_d = set(), set()
-        if len(self.tracks) and len(Z):
-            C = np.linalg.norm(np.array([t.pos for t in self.tracks])[:, None] - Z[None], axis=2)
-            ri, ci = linear_sum_assignment(C)
+        if self.tracks and dets:
+            C = np.array([[self._cost(t, d) for d in dets] for t in self.tracks])
+            ri, ci = linear_sum_assignment(np.minimum(C, 1e6))
             for r, c in zip(ri, ci):
-                # The gate widens while a track is unseen, since the player kept moving.
-                if C[r, c] <= self.gate + 0.3 * self.tracks[r].misses:
-                    self._correct(self.tracks[r], Z[c])
+                if C[r, c] <= 3.5 + 0.3 * self.tracks[r].misses:   # ~99.8% gate, widening while unseen
+                    self._correct(self.tracks[r], dets[c])
                     assigned_t.add(r)
                     assigned_d.add(c)
         for i, t in enumerate(self.tracks):
             if i not in assigned_t:
                 t.misses += 1
-        self.tracks = [t for t in self.tracks if t.misses <= self.max_misses]
-        # New tracks, strongest detections first, while there is room on court.
-        free = sorted((c for c in range(len(Z)) if c not in assigned_d), key=lambda c: -dets[c].conf)
+        # Established players are kept while unseen (out of frame, behind someone) so they can be
+        # re-acquired with their identity; only short-lived tracks (ghosts) are dropped.
+        self.tracks = [t for t in self.tracks if t.misses <= self.max_misses or t.hits >= self.min_hits]
+        free = sorted((c for c in range(len(dets)) if c not in assigned_d), key=lambda c: -dets[c].conf)
         for c in free:
-            if len(self.tracks) >= self.max_players:
-                stale = max(self.tracks, key=lambda t: t.misses)
-                if stale.misses < 3:
-                    break
-                self.tracks.remove(stale)  # a long-lost track gives way to a fresh detection
-            if any(np.linalg.norm(t.pos - Z[c]) < 0.6 for t in self.tracks):
+            d = dets[c]
+            side = _side(d.court_xy)
+            if any(np.linalg.norm(t.pos - d.court_xy) < 0.6 for t in self.tracks):
                 continue
-            self.tracks.append(Track(self.next_id, np.array([*Z[c], 0, 0.0]), np.diag([0.1, 0.1, 1, 1.0])))
+            mine = [t for t in self.tracks if t.side == side]
+            if len(mine) >= self.per_side or len(self.tracks) >= self.max_players:
+                lost = [t for t in mine if t.misses >= 2]
+                limit = 0.5 if len(lost) > 1 else 0.7   # one candidate: only rule out a clear mismatch
+                lost = [t for t in lost if appearance_distance(t.feat, d.feat) < limit]
+                if not lost:
+                    continue  # a third person on this side (spectator, coach, ghost), or not this player
+                # Re-acquire the lost player who looks most like this person, keeping the identity.
+                t = min(lost, key=lambda t: appearance_distance(t.feat, d.feat))
+                t.feat = d.feat if t.feat is None or d.feat is None else 0.8 * t.feat + 0.2 * d.feat
+                t.x = np.array([*d.court_xy, 0, 0.0])
+                t.P = np.diag([*np.diag(self._R(d)), 1, 1.0])
+                t.misses = 0
+                t.det = d
+                continue
+            self.tracks.append(Track(self.next_id, np.array([*d.court_xy, 0, 0.0]),
+                                     np.diag([*np.diag(self._R(d)), 1, 1.0]), side=side, det=d, feat=d.feat))
             self.next_id += 1
         for t in self.tracks:
-            t.x[2:] *= 0.0 if t.misses else 1.0   # do not coast on stale velocity
+            if t.misses:
+                t.x[2:] = 0.0   # do not coast on stale velocity
             if t.misses <= self.coast:
                 t.history.append((frame_idx, float(t.x[0]), float(t.x[1])))
         # Briefly occluded players are reported at their last known position.
         return [t for t in self.tracks if t.misses <= self.coast]
 
-    def _correct(self, t: Track, z):
-        S = self.Hm @ t.P @ self.Hm.T + self.R
+    def _correct(self, t: Track, d: Detection):
+        S = self.Hm @ t.P @ self.Hm.T + self._R(d)
         K = t.P @ self.Hm.T @ np.linalg.inv(S)
-        t.x = t.x + K @ (z - self.Hm @ t.x)
+        t.x = t.x + K @ (d.court_xy - self.Hm @ t.x)
         t.P = (np.eye(4) - K @ self.Hm) @ t.P
         t.hits += 1
         t.misses = 0
+        t.det = d
+        if d.feat is not None:
+            t.feat = d.feat if t.feat is None else 0.9 * t.feat + 0.1 * d.feat
