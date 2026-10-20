@@ -88,6 +88,8 @@ From a camera at head height, one pixel on the far side of the court can span mo
 - Doubles has two players per side and nobody crosses the net mid-rally: a side never holds more than two identities, and a lost player is re-acquired by shirt color instead of getting a new ID.
 - Paths are smoothed offline (running median, then Gaussian) before metrics and the replay.
 
+Skeletons are steadied the same way (`pbcoach/pose.py`). The pose model looks at each frame on its own, so joints shake by a few pixels and a hidden limb comes back as a confident guess in the wrong place. Each player's joints are taken relative to their box, single-frame jumps are dropped, dropouts up to 0.4 s are bridged, and the rest is smoothed over time, more for small far players. On the PPA clip this cut frame-to-frame joint shake about 3x without lagging fast swings. Larger pose models were only about 15% steadier and 1.6 to 5x slower, so the small one stays the default (`--pose-model yolov8s-pose.pt` to change it).
+
 ## Run it
 
 The environment is managed with [uv](https://docs.astral.sh/uv/). `uv sync` creates `.venv` from `uv.lock`.
@@ -96,7 +98,7 @@ The environment is managed with [uv](https://docs.astral.sh/uv/). `uv sync` crea
 uv sync --extra yolo                                              # add the YOLO people detector (recommended for real footage)
 uv run pbcoach match.mp4 --out runs/match1                        # YOLO people detector if installed
 uv run pbcoach match.mp4 --out runs/match1 --detector foreground --empty-court empty.jpg
-uv run pytest -q tests/test_core.py                               # 14 tests
+uv run pytest -q tests/test_core.py                               # 15 tests
 uv run python -m tests.eval_calibration --seeds 4 --players       # angle-robustness benchmarks
 uv run python -m tests.eval_tracking
 ```
@@ -126,6 +128,7 @@ Keypoint names are listed in `pbcoach/court.py` (`KEYPOINTS`).
 | `pbcoach/coach.py` | Rule-based coaching findings, optional Claude debrief and Q&A |
 | `pbcoach/report.py` | Heatmaps, paths and kitchen-line distance series |
 | `pbcoach/demo.py` | Gradio web demo (`pbcoach-demo`) |
+| `pbcoach/pose.py` | Offline skeleton smoothing, outlier and dropout handling |
 | `pbcoach/replay3d.py` | Self-contained three.js 3D replay page |
 | `pbcoach/synth.py` | Synthetic multi-angle renderer used by the tests |
 

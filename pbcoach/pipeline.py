@@ -15,6 +15,7 @@ import numpy as np
 from . import court
 from .calibrate import Calibration, calibrate_from_points, calibrate_image, median_background
 from .metrics import player_metrics, team_metrics
+from .pose import smooth_poses
 from .players import CourtTracker, OccupancyDetector, YoloDetector, lift_keypoints, locate
 from .viz import draw_court, draw_ring, draw_skeleton, minimap, player_color
 
@@ -133,7 +134,7 @@ def build_replay(cal: Calibration, rows: list[dict], seen: dict, fps: float) -> 
         ps = []
         for r in by_frame[f]:
             p = {"id": r["player_id"], "team": r["team"], "x": r["x"], "y": r["y"]}
-            raw_xy, kp = (None, None) if r.get("filled") else seen.get(f, {}).get(r["player_id"], (None, None))
+            raw_xy, kp = (None, None) if r.get("filled") else seen.get(f, {}).get(r["player_id"], (None, None, None))[:2]
             if kp is not None:
                 J = lift_keypoints(cal, kp, raw_xy)
                 J[:, :2] += np.array([r["x"], r["y"]]) - raw_xy   # follow the smoothed position
@@ -168,7 +169,7 @@ def render_overlay(video, path: Path, cal: Calibration, rows, seen, stride, star
             positions[pid] = (r["x"], r["y"], r["team"])
             trails.setdefault(pid, []).append((r["x"], r["y"]))
             draw_ring(vis, cal, (r["x"], r["y"]), player_color(pid))
-            kp = seen.get(idx, {}).get(pid, (None, None))[1]
+            kp = seen.get(idx, {}).get(pid, (None, None, None))[1]
             if kp is not None:
                 draw_skeleton(vis, kp, player_color(pid))
             p = cal.to_image([(r["x"], r["y"])])[0]
@@ -186,10 +187,10 @@ def render_overlay(video, path: Path, cal: Calibration, rows, seen, stride, star
         writer.release()
 
 
-def make_detector(kind: str, background: np.ndarray, cal: Calibration):
+def make_detector(kind: str, background: np.ndarray, cal: Calibration, pose_model: str = "yolov8n-pose.pt"):
     if kind in ("auto", "yolo"):
         try:
-            return YoloDetector(cal=cal)
+            return YoloDetector(cal=cal, pose_weights=pose_model)
         except Exception as e:  # ultralytics/torch missing or weights unavailable
             if kind == "yolo":
                 raise
@@ -199,7 +200,7 @@ def make_detector(kind: str, background: np.ndarray, cal: Calibration):
 
 def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None = None, stride: int = 1,
         points_json: str | None = None, write_video: bool = True, empty_court: str | None = None,
-        progress=None) -> dict:
+        progress=None, pose_model: str = "yolov8n-pose.pt") -> dict:
     """progress: optional callback(fraction, message) for front ends."""
     report = progress or (lambda frac, msg: None)
     out = Path(out_dir)
@@ -237,11 +238,11 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
     for n in cal.notes:
         print("  note:", n)
 
-    det = make_detector(detector, bg, cal)
+    det = make_detector(detector, bg, cal, pose_model)
     total = end - start
     tracker = None
     rows = []
-    seen = {}   # frame -> {player_id: (raw ground xy, keypoints or None)} for rendering and 3D replay
+    seen = {}   # frame -> {player_id: (raw ground xy, keypoints or None, box)} for rendering and 3D replay
     for idx, frame, fps in read_frames(video, stride, start, end):
         if tracker is None:
             tracker = CourtTracker(fps)
@@ -254,9 +255,10 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
                          "sd": float(np.sqrt(np.trace(t.det.cov))) if t.det is not None and t.det.cov is not None
                          else None})
             if t.det is not None:
-                seen.setdefault(idx, {})[t.id] = (t.det.court_xy, t.det.keypoints)
+                seen.setdefault(idx, {})[t.id] = (t.det.court_xy, t.det.keypoints, t.det.box)
     fps_eff = tracker.dt ** -1 if tracker else 30.0
     rows = smooth_rows(rows, fps_eff)
+    smooth_poses(seen, fps_eff)
     with open(out / "tracks.csv", "w", newline="") as f:
         wcsv = csv.DictWriter(f, fieldnames=["frame", "t", "player_id", "team", "x", "y"], extrasaction="ignore")
         wcsv.writeheader()
@@ -283,8 +285,11 @@ def main():
     ap.add_argument("--points", help="JSON with image_points and keypoints for manual calibration")
     ap.add_argument("--empty-court", help="image of the empty court from the same camera position")
     ap.add_argument("--no-video", action="store_true")
+    ap.add_argument("--pose-model", default="yolov8n-pose.pt",
+                    help="pose weights; yolov8s-pose.pt is a little steadier and about 1.6x slower")
     a = ap.parse_args()
-    s = run(a.video, a.out, a.detector, a.max_frames, a.stride, a.points, not a.no_video, a.empty_court)
+    s = run(a.video, a.out, a.detector, a.max_frames, a.stride, a.points, not a.no_video, a.empty_court,
+            pose_model=a.pose_model)
     print(json.dumps({"players": s["players"], "teams": s["teams"]}, indent=2))
 
 

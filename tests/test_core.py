@@ -135,6 +135,25 @@ def test_lifted_pose_stands_upright_on_the_player():
     assert np.allclose(J[:, :2], g, atol=0.1)
 
 
+def test_pose_smoothing_steadies_joints_without_lagging_the_player():
+    from pbcoach.pose import smooth_track
+    rng = np.random.default_rng(0)
+    fps, n, h = 30.0, 60, 80.0
+    x0 = np.linspace(100, 400, n)                      # running fast across the image: 10 px per frame
+    rel = rng.uniform(-0.3, 0.3, (17, 2)) * h            # a fixed pose relative to the box
+    truth = np.stack([np.c_[x0[i] + rel[:, 0], 300 + rel[:, 1]] for i in range(n)])
+    kps = [np.c_[truth[i] + rng.normal(0, 2.0, (17, 2)), np.full(17, 0.9)] for i in range(n)]
+    kps[30][9, :2] += 40                                  # one wrist jumps to a wrong place
+    kps[40][9, 2] = 0.05                                  # and drops out for a frame
+    boxes = [(x0[i] - 25, 300 - h / 2, x0[i] + 25, 300 + h / 2) for i in range(n)]
+    out = smooth_track(kps, boxes, fps)
+    err_raw = np.median([np.linalg.norm(k[:, :2] - t, axis=1).mean() for k, t in zip(kps, truth)])
+    err = np.median([np.linalg.norm(k[:, :2] - t, axis=1).mean() for k, t in zip(out, truth)])
+    assert err < 0.6 * err_raw
+    assert np.linalg.norm(out[30][9, :2] - truth[30][9]) < 6     # outlier removed
+    assert out[40][9, 2] >= 0.3 and np.linalg.norm(out[40][9, :2] - truth[40][9]) < 6   # dropout bridged
+
+
 CORNERS = ["near_left", "near_right", "far_right", "far_left"]
 
 
