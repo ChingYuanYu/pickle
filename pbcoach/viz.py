@@ -4,7 +4,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from . import court
+from .court import PICKLEBALL, Court
 from .camera import project_w
 
 
@@ -43,8 +43,9 @@ def draw_skeleton(img: np.ndarray, kp: np.ndarray, color, min_conf: float = 0.3)
     return img
 
 
-def draw_court(img: np.ndarray, H: np.ndarray, color=(0, 255, 255), thickness: int = 2) -> np.ndarray:
-    for (x1, y1), (x2, y2) in court.SEGMENTS + [((0, court.NET_Y), (court.WIDTH, court.NET_Y))]:
+def draw_court(img: np.ndarray, H: np.ndarray, color=(0, 255, 255), thickness: int = 2,
+               court: Court = PICKLEBALL) -> np.ndarray:
+    for (x1, y1), (x2, y2) in list(court.segments) + [((0, court.net_y), (court.width, court.net_y))]:
         seg = np.linspace((x1, y1), (x2, y2), 40)
         pts, w = project_w(H, seg)
         pts = pts[w > 0]
@@ -53,20 +54,35 @@ def draw_court(img: np.ndarray, H: np.ndarray, color=(0, 255, 255), thickness: i
     return img
 
 
-def minimap(positions: dict, ppm: int = 30, margin: float = 2.0, trails: dict | None = None) -> np.ndarray:
+def map_margins(court: Court = PICKLEBALL, margin: float | None = None) -> tuple[float, float]:
+    """Ground shown beyond the sidelines and baselines on top-down maps: where players can be."""
+    return (court.runoff_side, court.runoff_back) if margin is None else (margin, margin)
+
+
+def map_px(x, y, court: Court = PICKLEBALL, ppm: int = 30, margin: float | None = None):
+    """Court meters -> top-down map pixels (far baseline at top, near baseline at bottom)."""
+    mx, my = map_margins(court, margin)
+    return (np.asarray(x) + mx) * ppm, (court.length - np.asarray(y) + my) * ppm
+
+
+def minimap(positions: dict, ppm: int = 30, margin: float | None = None, trails: dict | None = None,
+            court: Court = PICKLEBALL) -> np.ndarray:
     """Top-down court with players. positions: {player_id: (x, y, team)}."""
-    W = int((court.WIDTH + 2 * margin) * ppm)
-    Hh = int((court.LENGTH + 2 * margin) * ppm)
+    mx, my = map_margins(court, margin)
+    W = int((court.width + 2 * mx) * ppm)
+    Hh = int((court.length + 2 * my) * ppm)
     img = np.full((Hh, W, 3), (60, 110, 60), np.uint8)
 
-    def p(x, y):  # far baseline at top, near baseline at bottom
-        return int((x + margin) * ppm), int((court.LENGTH - y + margin) * ppm)
+    def p(x, y):
+        u, v = map_px(x, y, court, ppm, margin)
+        return int(u), int(v)
 
-    cv2.rectangle(img, p(0, 0), p(court.WIDTH, court.LENGTH), (150, 95, 40), -1)
-    cv2.rectangle(img, p(0, court.NVZ_NEAR_Y), p(court.WIDTH, court.NVZ_FAR_Y), (170, 120, 70), -1)
-    for (x1, y1), (x2, y2) in court.SEGMENTS:
+    cv2.rectangle(img, p(0, 0), p(court.width, court.length), (150, 95, 40), -1)
+    for x0, y0, x1, y1 in court.shade:
+        cv2.rectangle(img, p(x0, y0), p(x1, y1), (170, 120, 70), -1)
+    for (x1, y1), (x2, y2) in court.segments:
         cv2.line(img, p(x1, y1), p(x2, y2), (240, 240, 240), 2)
-    cv2.line(img, p(-0.3, court.NET_Y), p(court.WIDTH + 0.3, court.NET_Y), (30, 30, 30), 3)
+    cv2.line(img, p(-court.net_overhang, court.net_y), p(court.width + court.net_overhang, court.net_y), (30, 30, 30), 3)
     for pid, trail in (trails or {}).items():
         if len(trail) > 1:
             cv2.polylines(img, [np.array([p(x, y) for x, y in trail], np.int32)], False,

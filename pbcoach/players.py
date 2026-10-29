@@ -15,8 +15,8 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from . import court
 from .calibrate import Calibration
+from .court import PICKLEBALL
 
 
 @dataclass
@@ -207,7 +207,9 @@ class YoloDetector:
 
     def _far_roi(self, w: int, h: int):
         if self._roi is None and self.cal is not None:
-            xs, ys = np.meshgrid([-1.5, court.WIDTH / 2, court.WIDTH + 1.5], [court.NET_Y, court.LENGTH + 2.5])
+            c = self.cal.court
+            xs, ys = np.meshgrid([-0.75 * c.runoff_side, c.width / 2, c.width + 0.75 * c.runoff_side],
+                                 [c.net_y, c.length + 1.25 * c.runoff_back])
             g = np.stack([xs.ravel(), ys.ravel()], 1)
             pts = np.concatenate([self.cal.pose.project3d(np.c_[g, np.full(len(g), z)]) for z in (0.0, 2.2)])
             if np.isfinite(pts).all():
@@ -311,13 +313,16 @@ class OccupancyDetector:
     uses the recovered camera, it works the same from behind the baseline, the side, a corner
     or overhead, and it separates players whose image blobs merge."""
 
-    def __init__(self, cal: Calibration, background: np.ndarray, cell_m: float = 0.1, margin_m: float = 2.0,
+    def __init__(self, cal: Calibration, background: np.ndarray, cell_m: float = 0.1, margin_m: float | None = None,
                  heights=(0.1, 0.4, 0.7, 1.0, 1.3, 1.6), thresh: float = 0.8):
         self.fg = ForegroundDetector(background)
         h, w = background.shape[:2]
         self.size = (w, h)
-        xs = np.arange(-margin_m, court.WIDTH + margin_m + 1e-6, cell_m)
-        ys = np.arange(-margin_m, court.LENGTH + margin_m + 1e-6, cell_m)
+        c = cal.court
+        mx = c.runoff_side if margin_m is None else margin_m
+        my = c.runoff_back if margin_m is None else margin_m
+        xs = np.arange(-mx, c.width + mx + 1e-6, cell_m)
+        ys = np.arange(-my, c.length + my + 1e-6, cell_m)
         self.gx, self.gy = np.meshgrid(xs, ys)
         self.cell = cell_m
         self.thresh = thresh
@@ -346,7 +351,7 @@ class OccupancyDetector:
         # The net hides far players' feet in many views: samples behind it count as unknown.
         from .calibrate import _net_geometry
         net = np.zeros((h, w), bool)
-        poly, _ = _net_geometry(cal.pose)
+        poly, _ = _net_geometry(cal.pose, cal.court)
         if poly is not None and np.isfinite(poly).all() and np.abs(poly).max() < 1e6:
             m = np.zeros((h, w), np.uint8)
             cv2.fillPoly(m, [poly.astype(np.int32)], 255)
@@ -374,7 +379,35 @@ class OccupancyDetector:
         front_in = self.front_in if hidden is None else self.front_in & ~hidden[self.fy, self.fx]
         occ[~self.valid | ~feet_ok | (known.sum(1) < 3)] = 0
         occ[(front_in & fg[self.fy, self.fx]).any(1)] *= 0.3
-        return occ.reshape(self.gx.shape), feet_seen.reshape(self.gx.shape)
+        exact = fg[self.iy[:, 0], self.ix[:, 0]] & known[:, 0]
+        return occ.reshape(self.gx.shape), feet_seen.reshape(self.gx.shape), exact.reshape(self.gx.shape)
+
+    def _along_ray(self, occ, exact, p0, cam, slack_px: float = 4.0, half_width_m: float = 0.3):
+        """Slide a found player away from the camera onto the cells whose undilated foot sample
+        is on them. Nearest-cell-first search accepts feet up to a few pixels short of the real
+        ones (the feet mask is dilated), and far from the camera a few pixels along the viewing
+        ray span a meter (a tennis baseline 25 m away). The slide is limited to that slack."""
+        p0 = np.asarray(p0, dtype=np.float64)
+        u = p0 - np.asarray(cam, dtype=np.float64)
+        n = np.linalg.norm(u)
+        if n < 1e-6:
+            return tuple(p0)
+        u /= n
+        img = self.cal.to_image([p0, p0 + 0.1 * u])
+        px = float(np.linalg.norm(img[1] - img[0]))
+        if not np.isfinite(px) or px <= 0:
+            return tuple(p0)
+        reach_m = min(1.5, slack_px * 0.1 / px)
+        if reach_m < self.cell:
+            return tuple(p0)
+        d = np.stack([self.gx - p0[0], self.gy - p0[1]], -1)
+        along = d @ u
+        lat = np.abs(d[..., 0] * u[1] - d[..., 1] * u[0])
+        sel = exact & (occ >= self.thresh) & (along >= -half_width_m) & (along <= reach_m) & (lat <= half_width_m)
+        if sel.sum() < 2:
+            return tuple(p0)
+        shift = float(np.median(along[sel]))
+        return tuple(p0 + max(0.0, shift) * u)
 
     def __call__(self, frame: np.ndarray, max_people: int = 8) -> list[Detection]:
         """Greedy explaining-away. Cells whose feet are visible are accepted nearest-to-camera
@@ -391,7 +424,7 @@ class OccupancyDetector:
         for _ in range(4 * max_people):
             if len(out) >= max_people:
                 break
-            occ, feet = self.occupancy(fg, hidden)
+            occ, feet, exact = self.occupancy(fg, hidden)
             sm = cv2.blur(occ.astype(np.float32), (3, 3))
             seen = (sm >= self.thresh) & (occ >= self.thresh) & feet
             solid = seen & (cv2.blur(seen.astype(np.float32), (3, 3)) >= 2 / 9)  # isolated cells are noise
@@ -402,6 +435,7 @@ class OccupancyDetector:
                 wts = np.clip(occ[y0:y1, x0:x1] - 0.5, 0, None)
                 cx = float((self.gx[y0:y1, x0:x1] * wts).sum() / wts.sum())
                 cy = float((self.gy[y0:y1, x0:x1] * wts).sum() / wts.sum())
+                cx, cy = self._along_ray(occ, exact, (cx, cy), cam)
             else:
                 # Feet hidden (net or another player): the image only pins the player to a
                 # stretch along the viewing ray, so take the centre of that stretch.
@@ -435,7 +469,7 @@ def _cylinder_pts(c, r, z0, z1, n=16):
     return np.vstack([np.hstack([ring, np.full((n, 1), z0)]), np.hstack([ring, np.full((n, 1), z1)])])
 
 
-def locate(cal: Calibration, dets: list[Detection], margin_m: float = 2.0,
+def locate(cal: Calibration, dets: list[Detection], margin_m: float | None = None,
            size_range=(0.35, 1.8)) -> list[Detection]:
     """Attach foot points, court positions and their uncertainty; drop people off court or of implausible size."""
     kept = []
@@ -478,7 +512,7 @@ def locate(cal: Calibration, dets: list[Detection], margin_m: float = 2.0,
         if not cut and d.mask is None and d.box[1] > 2 and exp_h > 0:
             _fuse_height(cal, d, extent, exp_h)
         x, y = d.court_xy
-        if not (-margin_m <= x <= court.WIDTH + margin_m and -margin_m <= y <= court.LENGTH + margin_m):
+        if not cal.court.in_bounds(x, y, margin_m):
             continue
         kept.append(d)
     return kept
@@ -532,8 +566,6 @@ class Track:
         return self.side
 
 
-def _side(xy) -> str:
-    return "near" if xy[1] < court.NET_Y else "far"
 
 
 class CourtTracker:
@@ -541,13 +573,14 @@ class CourtTracker:
 
     Each detection carries its own position covariance, so a far player seen by a low camera
     (where one pixel is most of a meter) is smoothed hard and gated loosely, while a near
-    player is followed closely. Doubles has two players per side, so a side never holds more
-    than two tracks: a detection that cannot be matched re-acquires that side's lost player
+    player is followed closely. Doubles has two players per side (singles one), so a side never
+    holds more tracks than that: a detection that cannot be matched re-acquires that side's lost player
     instead of starting a new identity.
     """
 
     def __init__(self, fps: float, max_players: int = 4, gate_m: float = 1.5, max_misses: int | None = None,
-                 per_side: int | None = None):
+                 per_side: int | None = None, net_y: float = PICKLEBALL.net_y):
+        self.net_y = net_y
         self.dt = 1.0 / fps
         self.max_players = max_players
         self.per_side = per_side or max(1, max_players // 2)
@@ -563,12 +596,15 @@ class CourtTracker:
         self.Hm = np.array([[1, 0, 0, 0], [0, 1, 0, 0.0]])
         self.R = np.eye(2) * 0.05 ** 2
 
+    def _side(self, xy) -> str:
+        return "near" if xy[1] < self.net_y else "far"
+
     def _R(self, d: Detection) -> np.ndarray:
         return d.cov if d.cov is not None else self.R
 
     def _cost(self, t: Track, d: Detection) -> float:
         """Mahalanobis distance, floored so that tiny covariances still allow normal motion."""
-        if _side(d.court_xy) != t.side:
+        if self._side(d.court_xy) != t.side:
             return np.inf   # players stay on their side of the net during a rally
         S = self.Hm @ t.P @ self.Hm.T + self._R(d) + np.eye(2) * (self.gate / 3) ** 2
         r = d.court_xy - t.pos
@@ -600,7 +636,7 @@ class CourtTracker:
         free = sorted((c for c in range(len(dets)) if c not in assigned_d), key=lambda c: -dets[c].conf)
         for c in free:
             d = dets[c]
-            side = _side(d.court_xy)
+            side = self._side(d.court_xy)
             if any(np.linalg.norm(t.pos - d.court_xy) < 0.6 for t in self.tracks):
                 continue
             mine = [t for t in self.tracks if t.side == side]

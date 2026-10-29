@@ -1,6 +1,7 @@
 """End-to-end prototype: video in, calibrated court, player tracks in meters, metrics out.
 
     python -m pbcoach.pipeline match.mp4 --out runs/match1
+    python -m pbcoach.pipeline tennis.mp4 --sport tennis --players 2 --out runs/tennis1
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import court
+from . import court as courts
 from .calibrate import Calibration, calibrate_from_points, calibrate_image, median_background
 from .metrics import player_metrics, team_metrics
 from .pose import smooth_poses
@@ -144,8 +145,13 @@ def build_replay(cal: Calibration, rows: list[dict], seen: dict, fps: float) -> 
         frames.append({"f": f, "t": by_frame[f][0]["t"], "players": ps})
     cam = cal.pose
     w, h = cal.image_size
-    return {"fps": fps, "court": {"width": court.WIDTH, "length": court.LENGTH, "net_y": court.NET_Y,
-                                  "nvz_near": court.NVZ_NEAR_Y, "nvz_far": court.NVZ_FAR_Y},
+    c = cal.court
+    return {"fps": fps, "court": {"sport": c.sport, "width": c.width, "length": c.length, "net_y": c.net_y,
+                                  "segments": [list(map(list, s)) for s in c.segments],
+                                  "shade": [list(r) for r in c.shade],
+                                  "net": {"overhang": c.net_overhang, "post": c.net_height_post,
+                                          "center": c.net_height_center},
+                                  "runoff": [c.runoff_side, c.runoff_back]},
             "camera": {"position": [round(float(v), 3) for v in cam.position],
                        "forward": [round(float(v), 4) for v in cam.R[2]],
                        "up": [round(float(-v), 4) for v in cam.R[1]],
@@ -162,7 +168,7 @@ def render_overlay(video, path: Path, cal: Calibration, rows, seen, stride, star
     trails = {}
     writer = None
     for idx, frame, fps in read_frames(video, stride, start, end):
-        vis = draw_court(frame.copy(), cal.H, (0, 220, 255), 1)
+        vis = draw_court(frame.copy(), cal.H, (0, 220, 255), 1, court=cal.court)
         positions = {}
         for r in by_frame.get(idx, []):
             pid = r["player_id"]
@@ -176,7 +182,8 @@ def render_overlay(video, path: Path, cal: Calibration, rows, seen, stride, star
             if np.isfinite(p).all():
                 cv2.putText(vis, str(pid), (int(p[0]) + 6, int(p[1]) + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                             player_color(pid), 2, cv2.LINE_AA)
-        mm = minimap(positions, trails={k: v[-int(3 * fps):] for k, v in trails.items() if k in positions})
+        mm = minimap(positions, trails={k: v[-int(3 * fps):] for k, v in trails.items() if k in positions},
+                     court=cal.court)
         h = vis.shape[0]
         mm = cv2.resize(mm, (int(mm.shape[1] * h / mm.shape[0]), h))
         panel = np.hstack([vis, mm])
@@ -200,8 +207,13 @@ def make_detector(kind: str, background: np.ndarray, cal: Calibration, pose_mode
 
 def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None = None, stride: int = 1,
         points_json: str | None = None, write_video: bool = True, empty_court: str | None = None,
-        progress=None, pose_model: str = "yolov8n-pose.pt") -> dict:
-    """progress: optional callback(fraction, message) for front ends."""
+        progress=None, pose_model: str = "yolov8n-pose.pt", sport: str = "pickleball",
+        players: int | None = None) -> dict:
+    """progress: optional callback(fraction, message) for front ends.
+    sport: "pickleball" or "tennis". players: 2 (singles) or 4 (doubles); defaults to doubles for
+    pickleball and singles for tennis."""
+    court = courts.get(sport)
+    players = players or court.default_players
     report = progress or (lambda frac, msg: None)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -226,13 +238,13 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
     report(0.1, "Finding the court and the camera")
     if points_json:
         spec = json.loads(Path(points_json).read_text())
-        cal = calibrate_from_points(spec["image_points"], spec["keypoints"], (w, h))
+        cal = calibrate_from_points(spec["image_points"], spec["keypoints"], (w, h), court=court)
     else:
-        cal = calibrate_image(bg)
+        cal = calibrate_image(bg, court=court)
         if cal is None:
             raise SystemExit("court not found; pass --points with 4+ clicked court keypoints")
     (out / "calibration.json").write_text(json.dumps(cal.summary(), indent=2))
-    cv2.imwrite(str(out / "calibration.jpg"), draw_court(bg.copy(), cal.H))
+    cv2.imwrite(str(out / "calibration.jpg"), draw_court(bg.copy(), cal.H, court=court))
     print(f"calibration: score={cal.score:.2f} view={cal.pose.view} "
           f"camera height={cal.pose.position[2]:.1f} m elevation={cal.pose.elevation_deg:.0f} deg")
     for n in cal.notes:
@@ -245,7 +257,7 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
     seen = {}   # frame -> {player_id: (raw ground xy, keypoints or None, box)} for rendering and 3D replay
     for idx, frame, fps in read_frames(video, stride, start, end):
         if tracker is None:
-            tracker = CourtTracker(fps)
+            tracker = CourtTracker(fps, max_players=players, net_y=court.net_y)
         if total and idx % (5 * stride) == 0:
             report(0.1 + 0.75 * (idx - start) / total, f"Tracking players: frame {idx - start} of {total}")
         tracks = tracker.update(locate(cal, det(frame)), idx)
@@ -269,7 +281,9 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
         report(0.88, "Drawing the overlay video")
         render_overlay(video, out / "overlay.mp4", cal, rows, seen, stride, start, end)
     fps_eff = tracker.dt ** -1 if tracker else 30.0
-    summary = {"calibration": cal.summary(), "players": player_metrics(rows, fps_eff), "teams": team_metrics(rows)}
+    summary = {"sport": court.sport, "format": "singles" if players <= 2 else "doubles",
+               "calibration": cal.summary(), "players": player_metrics(rows, fps_eff, court),
+               "teams": team_metrics(rows, court)}
     (out / "metrics.json").write_text(json.dumps(summary, indent=2))
     report(1.0, "Done")
     return summary
@@ -278,6 +292,9 @@ def run(video: str, out_dir: str, detector: str = "auto", max_frames: int | None
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("video")
+    ap.add_argument("--sport", choices=sorted(courts.COURTS), default="pickleball")
+    ap.add_argument("--players", type=int, choices=[2, 4],
+                    help="2 for singles, 4 for doubles (default: doubles for pickleball, singles for tennis)")
     ap.add_argument("--out", default="runs/latest")
     ap.add_argument("--detector", choices=["auto", "yolo", "foreground"], default="auto")
     ap.add_argument("--max-frames", type=int)
@@ -289,7 +306,7 @@ def main():
                     help="pose weights; yolov8s-pose.pt is a little steadier and about 1.6x slower")
     a = ap.parse_args()
     s = run(a.video, a.out, a.detector, a.max_frames, a.stride, a.points, not a.no_video, a.empty_court,
-            pose_model=a.pose_model)
+            pose_model=a.pose_model, sport=a.sport, players=a.players)
     print(json.dumps({"players": s["players"], "teams": s["teams"]}, indent=2))
 
 

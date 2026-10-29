@@ -40,6 +40,8 @@ import * as THREE from 'three';
 import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
 const R = __REPLAY__;
 const C = R.court, W = C.width, L = C.length;
+const NET = C.net || {overhang: .3, post: .914, center: .864}, RUN = C.runoff || [2, 2];
+const SPAN = Math.max(W + 2 * RUN[0], L + 2 * RUN[1]);   // scene size, for lights and camera presets
 const P = (x, y, z = 0) => new THREE.Vector3(x - W / 2, z, -(y - L / 2));   // court meters -> scene
 
 const el = document.getElementById('c');
@@ -57,17 +59,17 @@ scene.add(new THREE.HemisphereLight(0xffffff, 0x334433, 1.1));
 const sun = new THREE.DirectionalLight(0xffffff, 1.4);
 sun.position.set(-6, 14, 8); sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-Object.assign(sun.shadow.camera, {left: -12, right: 12, top: 12, bottom: -12});
+Object.assign(sun.shadow.camera, {left: -SPAN / 2, right: SPAN / 2, top: SPAN / 2, bottom: -SPAN / 2});
 scene.add(sun);
 
-// Court: surround, playing area, kitchen, lines, net.
+// Court: surround, playing area, shaded zones (kitchen / service boxes), lines, net.
 function plane(w, l, color, cx, cy, y = 0) {
   const m = new THREE.Mesh(new THREE.PlaneGeometry(w, l), new THREE.MeshStandardMaterial({color, roughness: .95}));
   m.rotation.x = -Math.PI / 2; m.position.copy(P(cx, cy, y)); m.receiveShadow = true; scene.add(m); return m;
 }
-plane(W + 8, L + 8, 0x2f6b45, W / 2, L / 2, -0.002);
+plane(W + 2 * RUN[0] + 4, L + 2 * RUN[1] + 4, 0x2f6b45, W / 2, L / 2, -0.002);
 plane(W, L, 0x2456a6, W / 2, L / 2);
-plane(W, C.nvz_far - C.nvz_near, 0x3a6fbf, W / 2, C.net_y, 0.001);
+(C.shade || []).forEach(([x0, y0, x1, y1]) => plane(x1 - x0, y1 - y0, 0x3a6fbf, (x0 + x1) / 2, (y0 + y1) / 2, 0.001));
 const lineMat = new THREE.MeshBasicMaterial({color: 0xffffff});
 function line(x1, y1, x2, y2) {
   const a = P(x1, y1, .004), b = P(x2, y2, .004), len = a.distanceTo(b);
@@ -75,16 +77,16 @@ function line(x1, y1, x2, y2) {
   m.rotation.x = -Math.PI / 2; m.rotation.z = -Math.atan2(b.z - a.z, b.x - a.x);
   m.position.copy(a.clone().add(b).multiplyScalar(.5)); scene.add(m);
 }
-[[0,0,W,0],[0,L,W,L],[0,0,0,L],[W,0,W,L],[0,C.nvz_near,W,C.nvz_near],[0,C.nvz_far,W,C.nvz_far],
- [W/2,0,W/2,C.nvz_near],[W/2,C.nvz_far,W/2,L]].forEach(s => line(...s));
-const net = new THREE.Mesh(new THREE.PlaneGeometry(W + .6, .86),
+C.segments.forEach(([[x1, y1], [x2, y2]]) => line(x1, y1, x2, y2));
+const NW = W + 2 * NET.overhang, NH = (NET.post + NET.center) / 2;
+const net = new THREE.Mesh(new THREE.PlaneGeometry(NW, NH - .03),
   new THREE.MeshStandardMaterial({color: 0x111111, transparent: true, opacity: .55, side: THREE.DoubleSide}));
-net.position.copy(P(W / 2, C.net_y, .43)); scene.add(net);
-const tape = new THREE.Mesh(new THREE.BoxGeometry(W + .6, .05, .03), new THREE.MeshStandardMaterial({color: 0xffffff}));
-tape.position.copy(P(W / 2, C.net_y, .88)); scene.add(tape);
-for (const x of [-.3, W + .3]) {
-  const post = new THREE.Mesh(new THREE.CylinderGeometry(.03, .03, .92), new THREE.MeshStandardMaterial({color: 0x222222}));
-  post.position.copy(P(x, C.net_y, .46)); post.castShadow = true; scene.add(post);
+net.position.copy(P(W / 2, C.net_y, (NH - .03) / 2)); scene.add(net);
+const tape = new THREE.Mesh(new THREE.BoxGeometry(NW, .05, .03), new THREE.MeshStandardMaterial({color: 0xffffff}));
+tape.position.copy(P(W / 2, C.net_y, NH)); scene.add(tape);
+for (const x of [-NET.overhang, W + NET.overhang]) {
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(.03, .03, NET.post), new THREE.MeshStandardMaterial({color: 0x222222}));
+  post.position.copy(P(x, C.net_y, NET.post / 2)); post.castShadow = true; scene.add(post);
 }
 
 // Players.
@@ -141,10 +143,10 @@ function show(i) {
 // Camera presets.
 const cam = R.camera;
 const VIEWS = {
-  'Broadcast': [P(W / 2, -9, 6.5), P(W / 2, L / 2, 0)],
-  'Behind far baseline': [P(W / 2, L + 9, 6.5), P(W / 2, L / 2, 0)],
-  'Side': [P(W + 11, L / 2, 5), P(W / 2, L / 2, 0)],
-  'Top': [P(W / 2, L / 2 - .01, 19), P(W / 2, L / 2, 0)],
+  'Broadcast': [P(W / 2, -.67 * L, .48 * L), P(W / 2, L / 2, 0)],
+  'Behind far baseline': [P(W / 2, 1.67 * L, .48 * L), P(W / 2, L / 2, 0)],
+  'Side': [P(W + .82 * L, L / 2, .37 * L), P(W / 2, L / 2, 0)],
+  'Top': [P(W / 2, L / 2 - .01, 1.42 * L), P(W / 2, L / 2, 0)],
   'Match camera': [P(...cam.position), P(cam.position[0] + 10 * cam.forward[0], cam.position[1] + 10 * cam.forward[1], Math.max(0, cam.position[2] + 10 * cam.forward[2]))],
 };
 const views = document.getElementById('views');

@@ -50,6 +50,9 @@ def line_mask(img: np.ndarray, max_line_px: int | None = None, max_saturation: f
         bn = (bg ** 2).sum(-1, keepdims=True)
         s = np.clip((ab * bg).sum(-1, keepdims=True) / np.maximum(bn, 1.0), 0.0, 1.0)
         resid = np.linalg.norm(ab - s * bg, axis=-1)
+        # Compressed video stores color at half resolution, smearing a thin colored line's chroma
+        # onto its neighbours: judge each pixel by the strongest color residual next to it.
+        resid = cv2.dilate(resid, np.ones((3, 3), np.uint8))
         # Blending scales the residual and the brightness gain equally, so their ratio
         # separates white from colored lines even when a far line is only a pixel wide.
         mask[resid > max_saturation * np.maximum(tophat.astype(np.float32), 1.0)] = 0
