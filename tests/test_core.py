@@ -159,3 +159,76 @@ CORNERS = ["near_left", "near_right", "far_right", "far_left"]
 
 def synth_H(name):
     return synth.render(_view(name), synth.Scene(), seed=0)[1]
+
+
+# ---------------------------------------------------------------- tennis
+
+def _tview(name):
+    return next(v for v in synth.TENNIS_VIEWS if v.name == name)
+
+
+def test_tennis_court_dimensions():
+    from pbcoach.court import TENNIS
+    assert TENNIS.width == pytest.approx(10.9728)
+    assert TENNIS.length == pytest.approx(23.7744)
+    assert TENNIS.net_y - TENNIS.keypoints["service_near_center"][1] == pytest.approx(6.4008)
+    assert TENNIS.keypoints["near_singles_right"][0] - TENNIS.keypoints["near_singles_left"][0] == pytest.approx(8.2296)
+    assert TENNIS.net_tape_height(TENNIS.center_x) == pytest.approx(0.9144)
+    assert TENNIS.net_tape_height(-TENNIS.net_overhang) == pytest.approx(1.0668)
+
+
+@pytest.mark.parametrize("name", ["broadcast_high", "corner_high", "sideline_high"])
+def test_tennis_auto_calibration(name):
+    from pbcoach.court import TENNIS
+    img, H_true, *_ = synth.render(_tview(name), synth.Scene(court=TENNIS), seed=0)
+    cal = calibrate_image(img, court=TENNIS)
+    assert cal is not None and cal.court is TENNIS
+    mean_err, max_err, _ = court_error_m(cal.H, H_true, (img.shape[1], img.shape[0]), TENNIS)
+    assert mean_err < 0.2 and max_err < 0.6   # the court is 1.8x as long as pickleball's
+
+
+def test_tennis_manual_calibration():
+    from pbcoach.court import TENNIS
+    img, H_true, *_ = synth.render(_tview("broadcast_high"), synth.Scene(court=TENNIS), seed=0)
+    names = ["near_left", "near_right", "service_far_right", "service_far_left"]
+    pts = project(H_true, [TENNIS.keypoints[n] for n in names])
+    cal = calibrate_from_points(pts, names, (img.shape[1], img.shape[0]), court="tennis")
+    assert np.allclose(cal.to_court([(640, 360)]), project(np.linalg.inv(H_true), [(640, 360)]), atol=1e-3)
+    assert cal.summary()["sport"] == "tennis"
+
+
+def test_singles_tracker_keeps_one_player_per_side():
+    from pbcoach.court import TENNIS
+    tr = CourtTracker(fps=10, max_players=2, net_y=TENNIS.net_y)
+    d = lambda x, y: Detection((0, 0, 1, 1), 0.9, court_xy=np.array([x, y]), cov=np.eye(2) * 0.01)
+    for f in range(20):   # a ball kid standing near the far baseline must not become a third player
+        tracks = tr.update([d(5.0 + 0.1 * f, -0.5), d(6.0, 24.5), d(1.0, 26.0)], f)
+    assert len(tr.tracks) == 2
+    assert {t.team for t in tracks} == {"near", "far"}
+    assert np.allclose(next(t for t in tracks if t.team == "far").pos, (6.0, 24.5), atol=0.2)
+
+
+def test_tennis_coach_flags_deep_player_and_slow_recovery():
+    from pbcoach import coach
+    n, fps = 200, 10
+    # Player 1 camps 4 m behind the baseline; player 2 is pulled wide and drifts back slowly.
+    deep = [(5.5, -4.0)] * n
+    wide = []
+    for k in range(4):
+        wide += [(9.5, 24.0)] * 10 + [(9.5 - 0.1 * i, 24.0) for i in range(40)]
+    rows = _rows({1: ("near", deep), 2: ("far", wide)}, fps)
+    titles = {(i.who.split(" (")[0], i.title) for i in coach.analyze(rows, {"sport": "tennis"}, fps)}
+    assert ("Player 1", "Playing far behind the baseline") in titles
+    assert ("Player 2", "Slow to recover to the middle") in titles
+    assert ("Player 2", "Good baseline position") in titles
+
+
+def test_tennis_doubles_formation_metrics():
+    from pbcoach.court import TENNIS
+    from pbcoach.metrics import team_metrics
+    n = 20
+    rows = _rows({1: ("near", [(3.0, 0.2)] * n), 2: ("near", [(8.0, 9.0)] * n),   # one up, one back
+                  3: ("far", [(3.0, 23.5)] * n), 4: ("far", [(8.0, 23.5)] * n)})   # both back
+    m = team_metrics(rows, TENNIS)
+    assert m["near"]["share_one_up_one_back"] == 1.0
+    assert m["far"]["share_both_back"] == 1.0

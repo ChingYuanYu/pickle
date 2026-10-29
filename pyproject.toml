@@ -1,7 +1,7 @@
 [project]
 name = "pbcoach"
 version = "0.1.0"
-description = "Pickleball match analysis: angle-robust court calibration and player tracking in court meters"
+description = "Pickleball and tennis match analysis: angle-robust court calibration and player tracking in court meters"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

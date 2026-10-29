@@ -13,10 +13,15 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from . import court
+from . import court as courts
+from .court import PICKLEBALL, TENNIS_SERVICE_FROM_NET
+from .metrics import tennis_back, tennis_up
 
 KITCHEN_BAND_M = 1.0      # "at the kitchen line" = within 1 m of it
 BACK_M = 3.0              # "back" = more than 3 m behind the kitchen line
+DEEP_M = 3.0              # tennis: "very deep" = more than 3 m behind the baseline
+WIDE_M = 2.5              # tennis singles: "pulled wide" = more than 2.5 m from the center mark
+RECOVERED_M = 1.5         # ... and "recovered" = back within 1.5 m of it
 DEFAULT_MODEL = "claude-opus-5-5"
 
 
@@ -55,11 +60,22 @@ def _tracks(rows):
 
 def _behind_kitchen(team, xy):
     """Meters behind the team's own kitchen line (negative = inside the kitchen)."""
-    return court.NVZ_NEAR_Y - xy[:, 1] if team == "near" else xy[:, 1] - court.NVZ_FAR_Y
+    return PICKLEBALL.behind(team, xy[:, 1])
 
 
 def analyze(rows: list[dict], summary: dict, fps: float) -> list[Insight]:
+    """Findings for the sport in summary["sport"] (pickleball when absent)."""
+    court = courts.get(summary.get("sport"))
     tracks = _tracks(rows)
+    out = _camera_insights(summary, tracks)
+    if not tracks:
+        return out
+    if court.sport == "tennis":
+        return out + _tennis(tracks, fps, court)
+    return out + _pickleball(tracks, fps)
+
+
+def _camera_insights(summary: dict, tracks: dict) -> list[Insight]:
     out: list[Insight] = []
     cal = summary.get("calibration", {})
     if cal.get("score", 1.0) < 0.6:
@@ -69,8 +85,11 @@ def analyze(rows: list[dict], summary: dict, fps: float) -> list[Insight]:
     if not tracks:
         out.append(Insight("Camera", "info", "No players tracked",
                            "No one was tracked long enough to analyze. Check that players are visible on the court."))
-        return out
+    return out
 
+
+def _pickleball(tracks: dict, fps: float) -> list[Insight]:
+    out: list[Insight] = []
     for pid, (team, frames, xy) in sorted(tracks.items()):
         who = f"Player {pid} ({team} side)"
         behind = _behind_kitchen(team, xy)
@@ -79,7 +98,7 @@ def analyze(rows: list[dict], summary: dict, fps: float) -> list[Insight]:
         # Moving up through the transition zone is fine; standing in it is not.
         k = max(1, int(round(0.5 * fps)))
         forward = np.gradient(-np.convolve(behind, np.ones(k) / k, mode="same"), t) if len(t) > 2 else np.zeros(len(t))
-        transition = (behind > KITCHEN_BAND_M) & (behind < court.NVZ_NEAR_Y - 1.5) & (forward < 0.5)
+        transition = (behind > KITCHEN_BAND_M) & (behind < PICKLEBALL.front_y - 1.5) & (forward < 0.5)
         if at_line.any():
             t_up = float(t[np.argmax(at_line)])
             if t_up > 4.0:
@@ -139,6 +158,123 @@ def analyze(rows: list[dict], summary: dict, fps: float) -> list[Insight]:
     return out
 
 
+def _excursions(off: np.ndarray, t: np.ndarray):
+    """Recovery times (s) after each time the player was pulled wide; None if they never got back."""
+    out, i = [], 0
+    while i < len(off):
+        if off[i] > WIDE_M:
+            j = i
+            while j < len(off) and off[j] > RECOVERED_M:
+                j += 1
+            out.append(float(t[j] - t[i]) if j < len(off) else None)
+            i = j
+        i += 1
+    return out
+
+
+def _tennis(tracks: dict, fps: float, court) -> list[Insight]:
+    out: list[Insight] = []
+    by_team = defaultdict(list)
+    for pid, (team, frames, xy) in tracks.items():
+        by_team[team].append((pid, frames, xy))
+    singles = all(len(v) == 1 for v in by_team.values())
+    service = court.net_y - TENNIS_SERVICE_FROM_NET       # service line, meters from the baseline
+    for pid, (team, frames, xy) in sorted(tracks.items()):
+        who = f"Player {pid} ({team} side)"
+        t = (frames - frames[0]) / fps
+        depth = court.behind(team, xy[:, 1])               # meters behind own baseline
+        fwd = court.from_baseline(team, xy[:, 1])
+        up = tennis_up(court, team, xy[:, 1])
+        back = ~up
+        if back.mean() > 0.5:
+            d = float(np.median(depth[back]))
+            if d > DEEP_M:
+                out.append(Insight(who, "improve", "Playing far behind the baseline",
+                                   f"Usually stood {d:.1f} m behind the baseline. From that deep the opponent gets "
+                                   "sharper angles and short balls are hard to reach. Try holding about 1 m behind "
+                                   "the baseline and stepping in when the ball lands short."))
+            elif d < -1.0:
+                out.append(Insight(who, "info", "Stays inside the baseline",
+                                   f"Usually stood {-d:.1f} m inside the baseline. That takes time away from the "
+                                   "opponent, but deep balls will jam you; take a step back against heavy hitters."))
+            else:
+                out.append(Insight(who, "strength", "Good baseline position",
+                                   f"Usually stood {d:+.1f} m from the baseline, close enough to take the ball early "
+                                   "and deep enough to handle depth."))
+        k = max(1, int(round(0.5 * fps)))
+        speed = np.gradient(np.convolve(fwd, np.ones(k) / k, mode="same"), t) if len(t) > 2 else np.zeros(len(t))
+        no_mans = (fwd > 1.5) & (fwd < service - 1.0) & (speed < 0.5)
+        if no_mans.mean() > 0.2:
+            out.append(Insight(who, "improve", "Caught in no-man's land",
+                               f"Spent {no_mans.mean():.0%} of the time between the baseline and the service line "
+                               "without moving forward, where balls land at your feet. After a short ball, either "
+                               "close in to the net or recover behind the baseline."))
+        # Net approaches: getting inside the service line and staying for at least half a second.
+        runs = np.diff(np.r_[0, up.astype(int), 0])
+        starts, ends = np.nonzero(runs == 1)[0], np.nonzero(runs == -1)[0]
+        approaches = int(sum((t[min(e, len(t)) - 1] - t[s_]) >= 0.5 for s_, e in zip(starts, ends)))
+        if singles and approaches:
+            out.append(Insight(who, "strength", "Comes to the net",
+                               f"Moved in to the net {approaches} time(s). Finishing points at the net shortens "
+                               "rallies; approach behind a deep or short-angled ball."))
+        elif singles and t[-1] >= 20:
+            out.append(Insight(who, "info", "Stayed back the whole clip",
+                               "Never came in past the service line. Look for short balls to attack and follow in."))
+        if singles:
+            rec = _excursions(np.abs(xy[:, 0] - court.center_x), t)
+            done = [r for r in rec if r is not None]
+            if len(rec) >= 2 and (len(done) < len(rec) / 2 or np.median(done) > 2.5):
+                out.append(Insight(who, "improve", "Slow to recover to the middle",
+                                   f"After being pulled wide ({len(rec)} times), you got back toward the center "
+                                   + (f"in {np.median(done):.1f} s on average" if done else "rarely") +
+                                   ". Recover with side shuffles right after your shot, and split-step as the "
+                                   "opponent hits."))
+            elif len(done) >= 2:
+                out.append(Insight(who, "strength", "Recovers to the middle",
+                                   f"Got back toward the center {np.median(done):.1f} s after being pulled wide, "
+                                   f"{len(done)} times."))
+
+    for team, players in sorted(by_team.items()):
+        if len(players) != 2:
+            continue
+        (pa, fa, xa), (pb, fb, xb) = players
+        common, ia, ib = np.intersect1d(fa, fb, return_indices=True)
+        if len(common) < 5:
+            continue
+        a, b = xa[ia], xb[ib]
+        ua, ub = tennis_up(court, team, a[:, 1]), tennis_up(court, team, b[:, 1])
+        ka, kb = tennis_back(court, team, a[:, 1]), tennis_back(court, team, b[:, 1])
+        both_up, both_back = ua & ub, ka & kb
+        one_one = (ua & kb) | (ub & ka)
+        who = f"{team.capitalize()} team (players {pa} and {pb})"
+        if both_up.mean() >= 0.3:
+            out.append(Insight(who, "strength", "Takes the net together",
+                               f"Both partners were at the net {both_up.mean():.0%} of the time, the strongest "
+                               "position in doubles."))
+        if one_one.mean() >= 0.5:
+            same_half = (np.sign(a[:, 0] - court.center_x) == np.sign(b[:, 0] - court.center_x)) & one_one
+            out.append(Insight(who, "info", "Mostly one up, one back",
+                               f"Played one up and one back {one_one.mean():.0%} of the time. The opening in this "
+                               "formation is the diagonal between partners; when the back player gets a short "
+                               "ball, both move up."))
+            if same_half.sum() > 0.4 * one_one.sum():
+                out.append(Insight(who, "improve", "Partners on the same half",
+                                   f"In {same_half.sum() / one_one.sum():.0%} of one-up-one-back moments both partners "
+                                   "were on the same half of the court, leaving the other half open. The net player "
+                                   "should cover the half in front of them while the partner takes the other."))
+        if both_back.sum() >= 5:
+            gap = float(np.median(np.abs(a[both_back, 0] - b[both_back, 0])))
+            if gap > 6.5:
+                out.append(Insight(who, "improve", "Gap down the middle",
+                                   f"When both were back, partners were {gap:.1f} m apart across the court. On an "
+                                   "11 m wide court that leaves the middle open; shift toward the ball together."))
+            elif gap < 2.5:
+                out.append(Insight(who, "improve", "Bunched together",
+                                   f"When both were back, partners were only {gap:.1f} m apart, which opens the "
+                                   "alleys. Each partner should cover their half and shade toward the ball."))
+    return out
+
+
 def to_markdown(insights: list[Insight]) -> str:
     icon = {"strength": "✅", "improve": "🎯", "info": "ℹ️"}
     lines = []
@@ -152,20 +288,30 @@ def to_markdown(insights: list[Insight]) -> str:
 
 def _context(summary: dict, insights: list[Insight]) -> str:
     cal = summary.get("calibration", {})
-    slim = {"camera": {"court_fit": cal.get("score"), "view": cal.get("camera", {}).get("view"),
+    slim = {"sport": summary.get("sport", "pickleball"), "format": summary.get("format"),
+            "camera": {"court_fit": cal.get("score"), "view": cal.get("camera", {}).get("view"),
                        "height_m": cal.get("camera", {}).get("height_m")},
             "players": summary.get("players"), "teams": summary.get("teams"),
             "insights": [asdict(i) for i in insights]}
     return json.dumps(slim, indent=1, default=str)
 
 
-SYSTEM = (
+SYSTEMS = {"pickleball": (
     "You are an experienced pickleball doubles coach. You are given movement data measured from a match "
     "video: court positions in meters (court is 6.1 m wide and 13.4 m long, kitchen line 2.13 m from the "
     "net), time at the kitchen line, partner spacing, and rule-based findings. You do not see the video, "
     "the ball or the shots, so do not invent anything about strokes, shot choice or the score. Be specific, "
     "practical and encouraging, refer to players by their numbers, and suggest one or two drills when useful."
-)
+), "tennis": (
+    "You are an experienced tennis coach. You are given movement data measured from a match video: court "
+    "positions in meters (doubles court 10.97 m wide and 23.77 m long, singles court 8.23 m wide, service line "
+    "6.40 m from the net), how far behind the baseline players stand, time in no-man's land, net approaches, "
+    "recovery to the middle after being pulled wide, doubles formations and rule-based findings. You do not see "
+    "the video, the ball or the strokes, so do not invent anything about technique, shot choice or the score. "
+    "Be specific, practical and encouraging, refer to players by their numbers, and suggest one or two drills "
+    "when useful."
+)}
+SYSTEM = SYSTEMS["pickleball"]
 
 
 def llm_available() -> bool:
@@ -181,10 +327,11 @@ def ask_coach(summary: dict, insights: list[Insight], question: str | None = Non
             {"role": "assistant", "content": "Got it. I have the movement data for this clip."}]
     msgs += history or []
     msgs.append({"role": "user", "content": question or
-                 "Give this team a short coaching debrief: the two most important things to work on, "
+                 "Give the players a short coaching debrief: the two most important things to work on, "
                  "what they are doing well, and one drill for next session. Under 200 words."})
+    system = SYSTEMS.get(summary.get("sport", "pickleball"), SYSTEM)
     resp = anthropic.Anthropic().messages.create(
-        model=os.environ.get("PBCOACH_MODEL", DEFAULT_MODEL), max_tokens=800, system=SYSTEM, messages=msgs)
+        model=os.environ.get("PBCOACH_MODEL", DEFAULT_MODEL), max_tokens=800, system=system, messages=msgs)
     return "".join(b.text for b in resp.content if b.type == "text")
 
 

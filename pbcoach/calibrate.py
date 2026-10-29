@@ -18,7 +18,8 @@ from itertools import combinations
 import cv2
 import numpy as np
 
-from . import court
+from . import court as courts
+from .court import PICKLEBALL, Court
 from .camera import CameraPose, best_focal, consistency_weight, focal_residual_curve, pose_from_homography, project, project_w
 from .lines import Line, detect_lines, floor_mask, group_by_vanishing_point, line_mask
 
@@ -31,6 +32,7 @@ class Calibration:
     pose: CameraPose
     method: str = "auto"
     notes: list[str] = field(default_factory=list)
+    court: Court = PICKLEBALL
 
     @property
     def H_inv(self) -> np.ndarray:
@@ -48,6 +50,7 @@ class Calibration:
 
     def summary(self) -> dict:
         return {
+            "sport": self.court.sport,
             "method": self.method,
             "score": round(self.score, 3),
             "ok": self.ok,
@@ -87,14 +90,14 @@ def _intersect(l1: np.ndarray, l2: np.ndarray) -> np.ndarray:
 class _Scorer:
     """Scores homographies by painted-line pixels they explain, weighted by image length."""
 
-    def __init__(self, mask: np.ndarray, step: float):
+    def __init__(self, mask: np.ndarray, step: float, court: Court = PICKLEBALL):
         self.h, self.w = mask.shape[:2]
         diag = np.hypot(self.h, self.w)
         self.tol = max(2.5, 0.004 * diag)
         self.cap = 0.02 * diag
         self.dist = cv2.distanceTransform(255 - mask, cv2.DIST_L2, 3)
         pts, same_next = [], []
-        for (x1, y1), (x2, y2) in court.SEGMENTS:
+        for (x1, y1), (x2, y2) in court.segments:
             n = max(2, int(np.hypot(x2 - x1, y2 - y1) / step) + 1)
             t = np.linspace(0, 1, n)
             pts.append(np.stack([x1 + (x2 - x1) * t, y1 + (y2 - y1) * t], 1))
@@ -140,12 +143,12 @@ class _Scorer:
         return score
 
 
-def _valid(Hs: np.ndarray, size) -> np.ndarray:
+def _valid(Hs: np.ndarray, size, court: Court = PICKLEBALL) -> np.ndarray:
     """Reject degenerate, mirrored and behind-camera hypotheses."""
     w_img, h_img = size
     ok = np.isfinite(Hs).all(axis=(1, 2))
     Hs = np.where(ok[:, None, None], Hs, np.eye(3))
-    c = np.hstack([court.CORNERS, np.ones((4, 1))])
+    c = np.hstack([court.corners, np.ones((4, 1))])
     P = np.einsum("nij,kj->nki", Hs, c)
     w = P[..., 2]
     same_side = (np.sign(w) == np.sign(w[:, :1])).all(1)
@@ -167,13 +170,13 @@ def _valid(Hs: np.ndarray, size) -> np.ndarray:
     return ok & same_side & not_mirrored & big_enough & bounded & convex, Hs_pos
 
 
-def _hypotheses(lines: list[Line], fam_a: list[int], fam_b: list[int]) -> np.ndarray:
+def _hypotheses(lines: list[Line], fam_a: list[int], fam_b: list[int], court: Court = PICKLEBALL) -> np.ndarray:
     """All homographies with fam_a lines as constant-y court lines and fam_b as constant-x."""
     L = np.array([l.abc for l in lines])
     across = [(i, j, ya, yb) for i, j in combinations(fam_a, 2)
-              for ya, yb in combinations(court.ACROSS_Y, 2) for (i, j) in ((i, j), (j, i))]
+              for ya, yb in combinations(court.across_y, 2) for (i, j) in ((i, j), (j, i))]
     along = [(k, m, xa, xb) for k, m in combinations(fam_b, 2)
-             for xa, xb in combinations(court.ALONG_X, 2) for (k, m) in ((k, m), (m, k))]
+             for xa, xb in combinations(court.along_x, 2) for (k, m) in ((k, m), (m, k))]
     if not across or not along:
         return np.zeros((0, 3, 3))
     A = np.array(across)
@@ -194,20 +197,20 @@ def _hypotheses(lines: list[Line], fam_a: list[int], fam_b: list[int]) -> np.nda
     return Hq @ Sinv
 
 
-def _search(lines: list[Line], families, mask: np.ndarray, top_k: int = 40, keep: int = 12):
+def _search(lines: list[Line], families, mask: np.ndarray, court: Court = PICKLEBALL, top_k: int = 40, keep: int = 12):
     """Cheap batched scoring of every hypothesis; returns the `keep` most promising homographies."""
     size = (mask.shape[1], mask.shape[0])
-    coarse = _Scorer(mask, step=0.5)
+    coarse = _Scorer(mask, step=0.5, court=court)
     pool = []
     fams = [f for _, f in families if len(f) >= 2]
     for fa in range(len(fams)):
         for fb in range(len(fams)):
             if fa == fb:
                 continue
-            Hs = _hypotheses(lines, fams[fa], fams[fb])
+            Hs = _hypotheses(lines, fams[fa], fams[fb], court)
             for chunk in range(0, len(Hs), 20000):
                 Hc = Hs[chunk:chunk + 20000]
-                ok, Hc = _valid(Hc, size)
+                ok, Hc = _valid(Hc, size, court)
                 Hc = Hc[ok]
                 if len(Hc) == 0:
                     continue
@@ -219,48 +222,49 @@ def _search(lines: list[Line], families, mask: np.ndarray, top_k: int = 40, keep
     if not pool:
         return []
     pool.sort(key=lambda t: -t[0])
-    fine = _Scorer(mask, step=0.1)
+    fine = _Scorer(mask, step=0.1, court=court)
     cands = np.array([H for _, H in pool[:top_k * 3]])
     s = fine(cands)
     s = np.where(s > 0, s * consistency_weight(cands, size), s)
     order = np.argsort(-s)
     out = []
     for i in order:  # drop near-duplicates so the shortlist covers distinct interpretations
-        c = project(cands[i], court.CORNERS)
-        if all(np.abs(c - project(o, court.CORNERS)).max() > 4 for o in out):
+        c = project(cands[i], court.corners)
+        if all(np.abs(c - project(o, court.corners)).max() > 4 for o in out):
             out.append(cands[i])
         if len(out) == keep:
             break
     return out
 
 
-def _net_geometry(pose: CameraPose):
-    """Image polygon of the net and the 2D line of its top tape, from the recovered camera."""
-    x0, x1, y = -0.3, court.WIDTH + 0.3, court.NET_Y
-    quad = np.array([(x0, y, 0), (x1, y, 0), (x1, y, court.NET_HEIGHT_POST), (x0, y, court.NET_HEIGHT_POST)])
-    X = np.hstack([quad, np.ones((4, 1))]) @ pose.P().T
+def _net_geometry(pose: CameraPose, court: Court = PICKLEBALL):
+    """Image polygon of the net (up to its sagging top) and the 2D line of its top tape, from the
+    recovered camera."""
+    x0, x1, y = -court.net_overhang, court.width + court.net_overhang, court.net_y
+    xs = np.linspace(x0, x1, 25)
+    tape = np.c_[xs, np.full(len(xs), y), court.net_tape_height(xs)]
+    outline = np.vstack([[(x0, y, 0), (x1, y, 0)], tape[::-1]])
+    X = np.hstack([outline, np.ones((len(outline), 1))]) @ pose.P().T
     if (X[:, 2] <= 0).any():
         return None, None
     poly = X[:, :2] / X[:, 2:3]
-    tape = np.array([(x, y, court.NET_HEIGHT_CENTER + (court.NET_HEIGHT_POST - court.NET_HEIGHT_CENTER)
-                      * abs(x - court.CENTER_X) / court.CENTER_X) for x in np.linspace(x0, x1, 25)])
-    return poly, pose.project3d(tape)
+    return poly, poly[2:][::-1]
 
 
-def _evaluate(H: np.ndarray, mask: np.ndarray) -> float:
+def _evaluate(H: np.ndarray, mask: np.ndarray, court: Court = PICKLEBALL) -> float:
     """Full score of one hypothesis: explained line length, minus painted lines that should be
     visible but are not (ignoring what the net hides), minus unexplained line pixels inside the court."""
     h, w = mask.shape[:2]
     if not np.isfinite(H).all():
         return -np.inf
-    scorer = _Scorer(mask, step=0.05)
+    scorer = _Scorer(mask, step=0.05, court=court)
     try:
-        pose = pose_from_homography(H, (w, h))
+        pose = pose_from_homography(H, (w, h), center=court.corners.mean(0))
     except (ValueError, np.linalg.LinAlgError):
         return -np.inf
     if pose.position[2] <= 0.2:
         return -np.inf
-    poly, tape = _net_geometry(pose)
+    poly, tape = _net_geometry(pose, court)
     occluded = np.zeros((h, w), np.uint8)
     if poly is not None and np.isfinite(poly).all() and np.abs(poly).max() < 1e6:
         cv2.fillPoly(occluded, [poly.astype(np.int32)], 255)
@@ -279,20 +283,20 @@ def _evaluate(H: np.ndarray, mask: np.ndarray) -> float:
     # Unexplained painted pixels inside the hypothesized court (e.g. a neighbouring court's lines).
     model = np.zeros((h, w), np.uint8)
     thick = int(max(3, 2 * scorer.tol))
-    for (x1, y1), (x2, y2) in court.SEGMENTS:
+    for (x1, y1), (x2, y2) in court.segments:
         seg, wv = project_w(H, np.linspace((x1, y1), (x2, y2), 30))
         if (wv > 0).all():
             cv2.polylines(model, [seg.astype(np.int32)], False, 255, thick)
     if tape is not None and np.isfinite(tape).all() and np.abs(tape).max() < 1e6:
         cv2.polylines(model, [tape.astype(np.int32)], False, 255, thick)
     inside = np.zeros((h, w), np.uint8)
-    corners, wv = project_w(H, court.CORNERS)
+    corners, wv = project_w(H, court.corners)
     if (wv > 0).all():
         cv2.fillPoly(inside, [corners.astype(np.int32)], 255)
     stray = (mask > 0) & (inside > 0) & (model == 0) & (occluded == 0)
     line_px = max(1.0, float(np.median(2 * cv2.distanceTransform(mask, cv2.DIST_L2, 3)[mask > 0])))
     unexplained = stray.sum() / line_px
-    tape_hit, tape_miss = _net_tape_evidence(H, scorer.dist, scorer.tol)
+    tape_hit, tape_miss = _net_tape_evidence(H, scorer.dist, scorer.tol, court)
     raw = float(explained[0]) + tape_hit - 0.5 * (missing + tape_miss) - 3.0 * unexplained
     # A real camera must explain the match: penalize hypotheses whose two focal estimates disagree.
     return raw * float(consistency_weight(H, (w, h))) if raw > 0 else raw
@@ -300,18 +304,21 @@ def _evaluate(H: np.ndarray, mask: np.ndarray) -> float:
 
 # ---------------------------------------------------------------- refinement
 
-_MODEL_LINES = [("y", v) for v in court.ACROSS_Y] + [("x", v) for v in court.ALONG_X]
+def _model_lines(court: Court):
+    return [("y", v) for v in court.across_y] + [("x", v) for v in court.along_x]
 
 
-def _model_line_extent(kind, v):
-    if kind == "y":
-        return (0.0, v), (court.WIDTH, v)
-    if v == court.CENTER_X:  # centerline is painted only outside the kitchen; fit both pieces
-        return (v, 0.0), (v, court.LENGTH)
-    return (v, 0.0), (v, court.LENGTH)
+def _model_line_samples(court: Court, kind, v, n: int = 60) -> np.ndarray:
+    """Points along the painted parts of one model line, in order (some lines, such as the
+    pickleball centerline, are painted only in pieces)."""
+    pieces = court.line_pieces(kind, v)
+    total = sum(np.hypot(b[0] - a[0], b[1] - a[1]) for a, b in pieces)
+    pts = [np.linspace(a, b, max(2, int(n * np.hypot(b[0] - a[0], b[1] - a[1]) / total))) for a, b in pieces]
+    pts = np.concatenate(pts)
+    return pts[np.argsort(pts[:, 0] if kind == "y" else pts[:, 1])]
 
 
-def _refine(H: np.ndarray, mask: np.ndarray, iters: int = 4) -> np.ndarray:
+def _refine(H: np.ndarray, mask: np.ndarray, court: Court = PICKLEBALL, iters: int = 4) -> np.ndarray:
     """Re-fit every visible model line to the line pixels near its projection, then re-solve H
     from all line intersections. Pixels on the net tape (located with the recovered camera)
     are ignored, and each line's search band never reaches halfway to its neighbours."""
@@ -319,8 +326,8 @@ def _refine(H: np.ndarray, mask: np.ndarray, iters: int = 4) -> np.ndarray:
     diag = np.hypot(h, w)
     ys, xs = np.nonzero(mask)
     mpts = np.stack([xs, ys], 1).astype(np.float64)
-    neighbours = {("y", v): [u for u in court.ACROSS_Y + (court.NET_Y,) if u != v] for v in court.ACROSS_Y}
-    neighbours.update({("x", v): [u for u in court.ALONG_X if u != v] for v in court.ALONG_X})
+    neighbours = {("y", v): [u for u in court.across_y + (court.net_y,) if u != v] for v in court.across_y}
+    neighbours.update({("x", v): [u for u in court.along_x if u != v] for v in court.along_x})
     for it in range(iters):
         base_band = max(2.0, 0.012 * diag * (0.6 ** it))
         keep = np.ones(len(mpts), bool)
@@ -328,17 +335,14 @@ def _refine(H: np.ndarray, mask: np.ndarray, iters: int = 4) -> np.ndarray:
             pose = pose_from_homography(H, (w, h))
         except (ValueError, np.linalg.LinAlgError):
             break
-        _, tape = _net_geometry(pose)
+        _, tape = _net_geometry(pose, court)
         if tape is not None and np.isfinite(tape).all() and np.abs(tape).max() < 1e6:
             tape_mask = np.zeros((h, w), np.uint8)
             cv2.polylines(tape_mask, [tape.astype(np.int32)], False, 255, int(max(4, base_band)))
             keep = tape_mask[ys, xs] == 0
         fitted = {}
-        for kind, v in _MODEL_LINES:
-            p1, p2 = _model_line_extent(kind, v)
-            seg = np.linspace(p1, p2, 60)
-            if kind == "x" and v == court.CENTER_X:
-                seg = seg[(seg[:, 1] <= court.NVZ_NEAR_Y) | (seg[:, 1] >= court.NVZ_FAR_Y)]
+        for kind, v in _model_lines(court):
+            seg = _model_line_samples(court, kind, v)
             img, wv = project_w(H, seg)
             vis = (wv > 0) & (img[:, 0] > 0) & (img[:, 0] < w) & (img[:, 1] > 0) & (img[:, 1] < h)
             if vis.sum() < 5:
@@ -386,25 +390,98 @@ def _refine(H: np.ndarray, mask: np.ndarray, iters: int = 4) -> np.ndarray:
     return H / H[2, 2]
 
 
+def _assign_line_pixels(H, mpts, court: Court, radius: float, tape=None):
+    """Line pixels within `radius` px of a painted segment's projection, with that segment's
+    index. Pixels nearer the net tape than any segment are left out."""
+    best = np.full(len(mpts), np.inf)
+    seg_of = np.full(len(mpts), -1)
+    for k, (p1, p2) in enumerate(court.segments):
+        q, wv = project_w(H, np.linspace(p1, p2, 2))
+        if (wv <= 0).any() or not np.isfinite(q).all():
+            continue
+        a, b = q
+        ab = b - a
+        n2 = float(ab @ ab)
+        if n2 < 1.0:
+            continue
+        t = np.clip((mpts - a) @ ab / n2, 0.0, 1.0)
+        d = np.linalg.norm(mpts - (a + t[:, None] * ab), axis=1)
+        closer = (d < radius) & (d < best)
+        best[closer] = d[closer]
+        seg_of[closer] = k
+    if tape is not None and np.isfinite(tape).all() and np.abs(tape).max() < 1e6:
+        dt = np.min([np.abs(np.cross(np.r_[b - a, 0], np.c_[mpts - a, np.zeros(len(mpts))])[:, 2])
+                     / max(np.linalg.norm(b - a), 1e-9) for a, b in zip(tape[:-1], tape[1:])], axis=0)
+        seg_of[dt < best] = -1
+    return seg_of
+
+
+def _polish(H: np.ndarray, mask: np.ndarray, court: Court = PICKLEBALL, max_per_line: int = 400,
+            seed: int = 0) -> np.ndarray:
+    """Sub-pixel finish: least-squares fit of H so that every painted line pixel lies on its
+    model line. The coarse search scores lines with a tolerance of several pixels, which is
+    plenty for a pickleball court but leaves the far end of a 24 m tennis court compressed
+    when the camera looks along it at a grazing angle."""
+    from scipy.optimize import least_squares
+
+    h, w = mask.shape[:2]
+    ys, xs = np.nonzero(mask)
+    if len(xs) < 50:
+        return H
+    mpts = np.stack([xs, ys], 1).astype(np.float64)
+    rng = np.random.default_rng(seed)
+    segs = np.array([(*p1, *p2) for p1, p2 in court.segments], dtype=np.float64)
+    H = H / H[2, 2]
+    for radius in (max(3.0, 0.004 * np.hypot(h, w)), 3.0, 2.0):
+        try:
+            _, tape = _net_geometry(pose_from_homography(H, (w, h)), court)
+        except (ValueError, np.linalg.LinAlgError):
+            tape = None
+        seg_of = _assign_line_pixels(H, mpts, court, radius, tape)
+        idx = []
+        for k in range(len(segs)):
+            mine = np.nonzero(seg_of == k)[0]
+            if len(mine) > max_per_line:
+                mine = rng.choice(mine, max_per_line, replace=False)
+            idx.append(mine)
+        idx = np.concatenate(idx)
+        if len(idx) < 30 or len(np.unique(seg_of[idx])) < 4:
+            return H
+        P, S = mpts[idx], segs[seg_of[idx]]
+        A, B = np.c_[S[:, :2], np.ones(len(S))], np.c_[S[:, 2:], np.ones(len(S))]
+
+        def resid(v, P=P, A=A, B=B):
+            Hv = np.append(v, 1.0).reshape(3, 3)
+            l = np.cross(A @ Hv.T, B @ Hv.T)          # image line through both projected endpoints
+            return (l[:, 0] * P[:, 0] + l[:, 1] * P[:, 1] + l[:, 2]) / np.maximum(np.hypot(l[:, 0], l[:, 1]), 1e-12)
+
+        r = least_squares(resid, H.ravel()[:8], loss="huber", f_scale=1.0, x_scale="jac", max_nfev=200)
+        Hn = np.append(r.x, 1.0).reshape(3, 3)
+        if not np.isfinite(Hn).all():
+            return H
+        H = Hn
+    return H
+
+
 # ---------------------------------------------------------------- public API
 
-def _canonical(H: np.ndarray, size) -> np.ndarray:
+def _canonical(H: np.ndarray, size, court: Court = PICKLEBALL) -> np.ndarray:
     """The court looks the same rotated 180 degrees; label the end closer to the camera as y = 0."""
-    R180 = np.array([[-1, 0, court.WIDTH], [0, -1, court.LENGTH], [0, 0, 1.0]])
+    R180 = np.array([[-1, 0, court.width], [0, -1, court.length], [0, 0, 1.0]])
     pose_a = pose_from_homography(H, size)
     # Camera y-position below the court midpoint means the near baseline is already y = 0.
-    return H if pose_a.position[1] <= court.NET_Y else H @ R180
+    return H if pose_a.position[1] <= court.net_y else H @ R180
 
 
-def _net_tape_samples(H, size, f):
+def _net_tape_samples(H, size, f, court: Court = PICKLEBALL):
     pose = pose_from_homography(H, size, f)
-    _, tape = _net_geometry(pose)
+    _, tape = _net_geometry(pose, court)
     if tape is None or not np.isfinite(tape).all() or np.abs(tape).max() > 1e6:
         return None
     return np.concatenate([np.linspace(a, b, 8, endpoint=False) for a, b in zip(tape[:-1], tape[1:])])
 
 
-def _net_tape_evidence(H, dist, tol, n_focal: int = 40):
+def _net_tape_evidence(H, dist, tol, court: Court = PICKLEBALL, n_focal: int = 40):
     """Image length of the net's white tape that this court hypothesis explains (best over
     focal lengths), and the length it predicts but is not there. The net stands on the
     court's midline, so a hypothesis that gets the court's orientation wrong puts it
@@ -413,7 +490,7 @@ def _net_tape_evidence(H, dist, tol, n_focal: int = 40):
     best = (0.0, 0.0)
     f0 = best_focal(H, (w, h))  # the tape may refine the focal length, not override the court's
     for f in np.geomspace(0.75 * f0, 1.33 * f0, n_focal):
-        pts = _net_tape_samples(H, (w, h), f)
+        pts = _net_tape_samples(H, (w, h), f, court)
         if pts is None:
             continue
         vis = (pts[:, 0] >= 0) & (pts[:, 0] < w - 1) & (pts[:, 1] >= 0) & (pts[:, 1] < h - 1)
@@ -429,9 +506,10 @@ def _net_tape_evidence(H, dist, tol, n_focal: int = 40):
     return best
 
 
-def _focal_from_net(H: np.ndarray, mask: np.ndarray) -> float | None:
+def _focal_from_net(H: np.ndarray, mask: np.ndarray, court: Court = PICKLEBALL) -> float | None:
     """The court plane alone pins down the focal length poorly when the camera looks straight
-    down the court. The net tape is a painted-white line at a known height (0.86 to 0.91 m),
+    down the court. The net tape is a painted-white line at a known height (0.86 to 0.91 m in
+    pickleball, 0.91 to 1.07 m in tennis),
     so try focal lengths and keep the one whose predicted tape lands on line pixels."""
     h, w = mask.shape[:2]
     fs, e = focal_residual_curve(H, (w, h))
@@ -449,7 +527,7 @@ def _focal_from_net(H: np.ndarray, mask: np.ndarray) -> float | None:
     best, best_hits = None, -1.0
     for f in candidates:
         pose = pose_from_homography(H, (w, h), f)
-        _, tape = _net_geometry(pose)
+        _, tape = _net_geometry(pose, court)
         if tape is None or not np.isfinite(tape).all():
             continue
         pts = np.concatenate([np.linspace(a, b, 8, endpoint=False) for a, b in zip(tape[:-1], tape[1:])])
@@ -467,38 +545,42 @@ def _focal_from_net(H: np.ndarray, mask: np.ndarray) -> float | None:
     return float(best)
 
 
-def line_coverage(H: np.ndarray, mask: np.ndarray) -> float:
+def line_coverage(H: np.ndarray, mask: np.ndarray, court: Court = PICKLEBALL) -> float:
     """Fraction of the visible painted court lines (by image length) that have line pixels under them."""
-    s = _Scorer(mask, step=0.05)
+    s = _Scorer(mask, step=0.05, court=court)
     _, explained, missing = s(H[None], return_parts=True)
     tot = explained[0] + missing[0]
     return float(explained[0] / tot) if tot > 0 else 0.0
 
 
-def calibrate_image(img: np.ndarray, focal_px: float | None = None) -> Calibration | None:
-    """Find the court in one image (or a median background frame)."""
+def calibrate_image(img: np.ndarray, focal_px: float | None = None, court: Court | str = PICKLEBALL) -> Calibration | None:
+    """Find the court of the given sport in one image (or a median background frame)."""
+    court = courts.get(court)
     h, w = img.shape[:2]
     mask = line_mask(img) * floor_mask(img)
     lines = detect_lines(mask)
     fams = group_by_vanishing_point(lines)
     if len(fams) < 2:
         return None
-    shortlist = _search(lines, fams, mask)
+    shortlist = _search(lines, fams, mask, court)
     if not shortlist:
         return None
     options = []
     for Hc in shortlist:  # keep the refined fit only where it actually explains the image better
-        options += [Hc, _refine(Hc, mask)]
+        options += [Hc, _refine(Hc, mask, court)]
     options = [Hc for Hc in options if np.isfinite(Hc).all()]
-    scores = [_evaluate(Hc, mask) for Hc in options]
+    scores = [_evaluate(Hc, mask, court) for Hc in options]
     if not options or max(scores) == -np.inf:
         return None
     H = options[int(np.argmax(scores))]
-    H = _canonical(H, (w, h))
+    Hp = _polish(H, mask, court)
+    if _evaluate(Hp, mask, court) >= max(scores) - 0.01 * abs(max(scores)):
+        H = Hp
+    H = _canonical(H, (w, h), court)
     if focal_px is None:
-        focal_px = _focal_from_net(H, mask)
-    pose = pose_from_homography(H, (w, h), focal_px)
-    cal = Calibration(H / H[2, 2], (w, h), line_coverage(H, mask), pose)
+        focal_px = _focal_from_net(H, mask, court)
+    pose = pose_from_homography(H, (w, h), focal_px, center=court.corners.mean(0))
+    cal = Calibration(H / H[2, 2], (w, h), line_coverage(H, mask, court), pose, court=court)
     if pose.position[2] < 0.3:
         cal.notes.append("camera height under 0.3 m looks implausible; check calibration")
     if pose.elevation_deg < 8:
@@ -506,13 +588,15 @@ def calibrate_image(img: np.ndarray, focal_px: float | None = None) -> Calibrati
     return cal
 
 
-def calibrate_from_points(image_pts, keypoint_names, image_size, focal_px: float | None = None) -> Calibration:
-    """Manual fallback: at least 4 clicked court keypoints (names from court.KEYPOINTS)."""
-    src = np.array([court.KEYPOINTS[n] for n in keypoint_names], dtype=np.float64)
+def calibrate_from_points(image_pts, keypoint_names, image_size, focal_px: float | None = None,
+                          court: Court | str = PICKLEBALL) -> Calibration:
+    """Manual fallback: at least 4 clicked court keypoints (names from court.keypoints)."""
+    court = courts.get(court)
+    src = np.array([court.keypoints[n] for n in keypoint_names], dtype=np.float64)
     dst = np.asarray(image_pts, dtype=np.float64)
     H, _ = cv2.findHomography(src, dst, 0)
-    pose = pose_from_homography(H, image_size, focal_px)
-    return Calibration(H / H[2, 2], tuple(image_size), 1.0, pose, method="manual")
+    pose = pose_from_homography(H, image_size, focal_px, center=court.corners.mean(0))
+    return Calibration(H / H[2, 2], tuple(image_size), 1.0, pose, method="manual", court=court)
 
 
 def median_background(frames: list[np.ndarray]) -> np.ndarray:

@@ -146,8 +146,11 @@ def consistency_weight(H, image_size):
     return np.exp(-np.maximum(0.0, e - 0.02) / 0.08)
 
 
-def pose_from_homography(H: np.ndarray, image_size: tuple[int, int], focal_px: float | None = None) -> CameraPose:
-    """Recover camera intrinsics (focal only, principal point at center) and pose."""
+def pose_from_homography(H: np.ndarray, image_size: tuple[int, int], focal_px: float | None = None,
+                         center=None) -> CameraPose:
+    """Recover camera intrinsics (focal only, principal point at center) and pose.
+
+    center: the court's center in court meters, for naming the view (pickleball court by default)."""
     w, h = image_size
     cx, cy = w / 2.0, h / 2.0
     T = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1.0]])
@@ -164,7 +167,7 @@ def pose_from_homography(H: np.ndarray, image_size: tuple[int, int], focal_px: f
     U, _, Vt = np.linalg.svd(R)
     R = U @ Vt
     C = -R.T @ t
-    center = np.array([court.WIDTH / 2, court.LENGTH / 2])
+    center = np.array([court.WIDTH / 2, court.LENGTH / 2] if center is None else center, dtype=np.float64)
     d = C[:2] - center
     horiz = float(np.hypot(*d))
     azimuth = float(np.degrees(np.arctan2(abs(d[0]), abs(d[1]))))
